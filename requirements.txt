@@ -1,0 +1,19 @@
+# requirements.txt — SRAO Agent dependencies
+
+# Google Cloud / Vertex AI
+google-adk==2.4.0
+google-cloud-aiplatform>=1.60.0
+vertexai
+google-cloud-secret-manager>=2.20.0
+google-auth>=2.29.0
+
+# Web server (Cloud Run mode)
+flask>=3.0.0
+gunicorn>=22.0.0
+
+# GitHub API
+requests>=2.31.0
+
+# Utilities
+pyyaml>=6.0.1
+python-dotenv>=1.0.0

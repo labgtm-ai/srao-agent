@@ -1,0 +1,43 @@
+# config/config.yaml
+# SRAO Agent Configuration
+# ─────────────────────────
+# Copy this file and set your values before deploying.
+# All values can also be set as environment variables (they take precedence).
+
+gcp:
+  project_id: "your-gcp-project-id"         # GCP Project ID
+  location:   "us-central1"                  # Vertex AI region
+  service_account: "srao-agent@your-gcp-project-id.iam.gserviceaccount.com"
+
+vertex_ai:
+  model: "gemini-2.0-flash-001"              # Vertex AI Gemini model
+  embedding_model: "text-embedding-004"      # For RAG vector embeddings
+  temperature: 0.1
+  max_output_tokens: 4096
+
+rag:
+  vector_index_endpoint_id: ""              # Leave blank to use fallback KB
+  deployed_index_id: "srao_java_docs_index"
+  top_k: 5                                  # Number of docs to retrieve
+
+github:
+  token_secret: "projects/your-project/secrets/github-token/versions/latest"
+  api_url: "https://api.github.com"
+  pr_base_branch: "main"                    # Default PR target branch
+
+agent:
+  max_retries: 3                            # Max retry attempts for failed fixes
+  severity_order: ["HIGH", "MEDIUM", "LOW"]
+  exclude_test_files: false
+  exclude_generated: true
+  output_dir: "/tmp/srao_reports"
+
+cloud_run:
+  port: 8080
+  memory: "2Gi"
+  cpu: "2"
+  timeout: "3600s"                          # 1 hour for large repos
+
+logging:
+  level: "INFO"
+  format: "json"                            # "json" for Cloud Logging, "text" for local
