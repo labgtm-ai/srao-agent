@@ -13,12 +13,12 @@ from typing import Optional
 
 import vertexai
 from vertexai.generative_models import GenerativeModel, GenerationConfig
-
+from pathlib import Path
 logger = logging.getLogger(__name__)
 
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "your-project-id")
 LOCATION   = os.environ.get("GCP_LOCATION",   "us-central1")
-MODEL_NAME = "gemini-2.0-flash-001"
+MODEL_NAME = "gemini-2.5-flash"
 
 MAX_RETRIES = 3
 
@@ -80,10 +80,10 @@ Return the same JSON format as before.
 
 def modernize_code_snippet(
     file_path: str,
-    legacy_code: str,
-    pattern_id: str,
     description: str,
     target_java: str,
+    legacy_code: str = "",
+    pattern_id: str = "",
     rag_context: str = "",
     previous_attempt: Optional[str] = None,
     validation_error: Optional[str] = None,
@@ -111,15 +111,45 @@ def modernize_code_snippet(
           "attempts":        int
         }
     """
+    
     vertexai.init(project=PROJECT_ID, location=LOCATION)
     model = GenerativeModel(
         MODEL_NAME,
         generation_config=GenerationConfig(
-            temperature=0.1,        # Low temperature for deterministic code
+            temperature=0.1,
             top_p=0.95,
             max_output_tokens=4096,
         ),
     )
+
+    # Load source from disk if not supplied
+    if not legacy_code and file_path:
+
+        try:
+            legacy_code = Path(file_path).read_text(
+                encoding="utf-8",
+                errors="ignore"
+            )
+
+            logger.info(
+                "Loaded source from %s (%d chars)",
+                file_path,
+                len(legacy_code),
+            )
+
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Unable to read source file: {e}"
+            }
+
+    logger.info(
+        "Modernizer input: file=%s pattern=%s code_length=%d",
+        file_path,
+        pattern_id,
+        len(legacy_code),
+    )
+
 
     java_version = _extract_version_number(target_java)
 

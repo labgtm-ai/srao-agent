@@ -10,7 +10,7 @@ gcp:
   service_account: "srao-agent@your-gcp-project-id.iam.gserviceaccount.com"
 
 vertex_ai:
-  model: "gemini-2.0-flash-001"              # Vertex AI Gemini model
+  model: "gemini-2.5-flash"              # Vertex AI Gemini model
   embedding_model: "text-embedding-004"      # For RAG vector embeddings
   temperature: 0.1
   max_output_tokens: 4096
