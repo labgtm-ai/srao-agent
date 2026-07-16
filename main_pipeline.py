@@ -387,7 +387,7 @@ def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
         logger.warning("No functional code adjustments were registered during agent execution loops. Skipping PR submission.")
 
 if __name__ == "__main__":
-    os.environ["GITHUB_TOKEN"] = "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"
+    os.environ["GITHUB_TOKEN"] = ""
     os.environ["GITHUB_OWNER"] = "labgtm-ai"
     os.environ["GITHUB_REPO"]  = "java-legacy-enterprise-app"
     
