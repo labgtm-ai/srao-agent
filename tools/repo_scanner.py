@@ -1,8 +1,8 @@
 """
 tools/repo_scanner.py
 ─────────────────────
-Clones a Git repository and enumerates Java source files.
-Used by the SRAO agent as the first step in the pipeline.
+Clones a Git repository, enumerates Java source files, applies modernized patches,
+and executes localized compilation checks for code validation.
 """
 
 import os
@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -21,23 +21,35 @@ def scan_repository(
     target_dir: Optional[str] = None,
 ) -> dict:
     """
-    Clone a Git repository and return metadata about its Java files.
+    Clone a Git repository or use a local directory path, returning metadata about its Java files.
 
     Args:
-        repo_url:   HTTPS or SSH URL of the Git repository.
-                    e.g. "https://github.com/org/my-service.git"
-        branch:     Branch to checkout (default: "main").
+        repo_url:   HTTPS, SSH URL, or a local directory path of the repository.
+                    e.g. "https://github.com/org/my-service.git" or "/workspace/my-app"
+        branch:     Branch to checkout (default: "main"). Ignored if a local path is provided.
         target_dir: Local path to clone into. Uses a temp dir if not specified.
 
     Returns:
         {
           "status":      "success" | "error",
-          "repo_path":   str   – local path of cloned repo,
+          "repo_path":   str   – local path of cloned or verified repo,
           "java_files":  list  – relative paths of all .java files,
           "total_files": int,
           "message":     str
         }
     """
+    # SRAO: Handle scenarios where a developer passes an absolute local file pathway instead of a remote git address
+    if os.path.exists(repo_url) and os.path.isdir(repo_url):
+        logger.info("Using existing local folder directory pathway path: %s", repo_url)
+        java_files = _find_java_files(repo_url)
+        return {
+            "status":      "success",
+            "repo_path":   str(Path(repo_url).resolve()),
+            "java_files":  java_files,
+            "total_files": len(java_files),
+            "message":     f"Local repository identified. Found {len(java_files)} Java source files.",
+        }
+
     clone_dir = target_dir or tempfile.mkdtemp(prefix="srao_repo_")
 
     try:
@@ -92,6 +104,88 @@ def list_java_files(repo_path: str, exclude_tests: bool = False) -> dict:
         return {"status": "success", "java_files": files, "count": len(files)}
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
+
+
+# ── Pipeline Synchronization Hooks ───────────────────────────────────────────
+
+def apply_patch(repo_root: str, relative_file_path: str, modernized_code: str) -> bool:
+    """Writes the modernized code content string directly to the target file path location."""
+    try:
+        full_path = Path(repo_root) / relative_file_path
+        
+        # SRAO: Create backup of the file to allow instant rollback capabilities if validation steps fail
+        backup_path = full_path.with_suffix(".java.bak")
+        if not backup_path.exists():
+            full_path.rename(backup_path)
+            
+        full_path.write_text(modernized_code, encoding="utf-8")
+        logger.info("Applied modernization patch update sequence to: %s", relative_file_path)
+        return True
+    except Exception as e:
+        logger.error("Failed to write updated patch file modifications to system disk: %s", e)
+        return False
+
+
+def revert_file_changes(repo_root: str, relative_file_path: str) -> None:
+    """Restores the backup file state if validation compiler checks break down."""
+    full_path = Path(repo_root) / relative_file_path
+    backup_path = full_path.with_suffix(".java.bak")
+    
+    if backup_path.exists():
+        if full_path.exists():
+            full_path.unlink()
+        backup_path.rename(full_path)
+        logger.info("Reverted workspace file alterations back to baseline configuration for: %s", relative_file_path)
+
+
+def clean_backup_files(repo_root: str, relative_file_path: str) -> None:
+    """Purges the backup snapshot item when code compilation checks clear successfully."""
+    full_path = Path(repo_root) / relative_file_path
+    backup_path = full_path.with_suffix(".java.bak")
+    if backup_path.exists():
+        backup_path.unlink()
+
+
+def run_compile_validation(repo_root: str, relative_file_path: str) -> Tuple[bool, str]:
+    """
+    Invokes localized build automation steps to verify file structural parsing validity.
+    Looks for localized Maven pom.xml components before defaulting to direct javac evaluations.
+    """
+    root_path = Path(repo_root)
+    full_file_path = root_path / relative_file_path
+    
+    # 1. Evaluate whether a structural Maven profile footprint encapsulates the directory scope
+    if (root_path / "pom.xml").exists():
+        try:
+            logger.info("Executing Maven targeted compilation checks inside: %s", repo_root)
+            # Run test-compile or compile limiting file updates to verify syntax without executing unit blocks
+            result = subprocess.run(
+                ["mvn", "clean", "compile", "-DskipTests=true"],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                timeout=180
+            )
+            if result.returncode == 0:
+                return True, ""
+            return False, result.stderr or result.stdout
+        except Exception as e:
+            return False, f"Automated Maven compilation engine run crashed out: {str(e)}"
+            
+    # 2. Fall back to manual standard javac validations if workspace is unmanaged
+    try:
+        logger.info("Executing localized javac compilation validation check on file: %s", relative_file_path)
+        result = subprocess.run(
+            ["javac", "-source", "17", "-target", "17", str(full_file_path)],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if result.returncode == 0:
+            return True, ""
+        return False, result.stderr
+    except Exception as e:
+        return False, f"Standard system compilation execution block dropped unexpectedly: {str(e)}"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

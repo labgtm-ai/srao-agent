@@ -2,22 +2,17 @@
 tools/rag_retriever.py
 ───────────────────────
 Retrieves relevant Java 17/21 documentation and code examples
-from a Vertex AI Vector Search index (RAG pipeline).
-
-The index is pre-built from:
-  - Java 17 / 21 JDK API docs
-  - JEP specifications (JEP 361, 395, 425, 436, etc.)
-  - Curated refactoring examples from OpenRewrite recipes
+from a Vertex AI Vector Search index or localized fallback maps.
 """
 
 import logging
 import os
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from google.cloud import aiplatform
 from vertexai.language_models import TextEmbeddingModel
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("srao.rag_retriever")
 
 # ── Configuration (from environment / config.yaml) ────────────────────────────
 PROJECT_ID        = os.environ.get("GCP_PROJECT_ID", "your-project-id")
@@ -27,7 +22,7 @@ DEPLOYED_INDEX_ID = os.environ.get("DEPLOYED_INDEX_ID", "srao_java_docs_index")
 EMBEDDING_MODEL   = "text-embedding-004"
 
 # Inline fallback knowledge base (used when vector index is not yet deployed)
-FALLBACK_KB: dict[str, str] = {
+FALLBACK_KB: Dict[str, str] = {
     "FOR_LOOP": """
 // Before (Java 7 style)
 List<String> names = Arrays.asList("Alice", "Bob", "Charlie");
@@ -145,32 +140,64 @@ public void increment() {
 }
 
 
-def retrieve_java_docs(pattern_id: str, context_snippet: str = "") -> dict:
+class RagRetriever:
+    """
+    SRAO multi-agent orchestration component matching vector lookups to code blocks.
+    """
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        self.config = config or {}
+        self.project_id = self.config.get("project_id", PROJECT_ID)
+        self.location = self.config.get("location", LOCATION)
+        self.endpoint_id = self.config.get("index_endpoint_id", INDEX_ENDPOINT_ID)
+        self.deployed_index_id = self.config.get("deployed_index_id", DEPLOYED_INDEX_ID)
+
+    def get_migration_recipe(self, pattern_id: str, context_snippet: str = "") -> str:
+        """
+        Main query entrypoint hook invoked by srao_agent.py orchestrator logic.
+        Returns a formatted markdown documentation payload string.
+        """
+        res = retrieve_java_docs(
+            pattern_id=pattern_id,
+            context_snippet=context_snippet,
+            project_id=self.project_id,
+            location=self.location,
+            endpoint_id=self.endpoint_id,
+            deployed_index_id=self.deployed_index_id
+        )
+        
+        # Format the mapping array into an explicit textual markdown instruction context block [2]
+        if res.get("status") == "success":
+            recipe_text = (
+                f"### Migration Recipe for {pattern_id}\n"
+                f"**Documentation Source:** {res.get('source')}\n"
+                f"Summary: {res.get('documentation')}\n\n"
+                f"Reference Legacy Example:\n```java\n{res.get('example_before')}\n```\n\n"
+                f"Target Modernized Equivalent Implementation:\n```java\n{res.get('example_after')}\n```"
+            )
+            return recipe_text
+        
+        return "No specific modernization recipes found for this target pattern token."
+
+
+def retrieve_java_docs(
+    pattern_id: str, 
+    context_snippet: str = "",
+    project_id: str = PROJECT_ID,
+    location: str = LOCATION,
+    endpoint_id: str = INDEX_ENDPOINT_ID,
+    deployed_index_id: str = DEPLOYED_INDEX_ID
+) -> dict:
     """
     Retrieve Java 17/21 documentation and refactoring examples for a pattern.
-
-    Args:
-        pattern_id:       One of the SRAO pattern IDs (e.g. "FOR_LOOP", "RAW_THREAD").
-        context_snippet:  The actual code snippet for context-aware retrieval.
-
-    Returns:
-        {
-          "status":          "success" | "error",
-          "pattern_id":      str,
-          "documentation":   str  – relevant Java docs / JEP summary,
-          "example_before":  str  – legacy code example,
-          "example_after":   str  – modernised code example,
-          "source":          "vector_index" | "fallback_kb"
-        }
     """
-    # Try vector index first
-    if INDEX_ENDPOINT_ID:
+    # Try vector index lookup first if endpoints are alive
+    if endpoint_id:
         try:
-            result = _query_vector_index(pattern_id, context_snippet)
+            result = _query_vector_index(pattern_id, context_snippet, project_id, location, endpoint_id, deployed_index_id)
             if result:
                 return {**result, "source": "vector_index"}
         except Exception as exc:
-            logger.warning("Vector index query failed, using fallback KB: %s", exc)
+            logger.warning("Vector index search dropped. Invoking fallback knowledge map fallback logic: %s", exc)
 
     # Fallback to inline knowledge base
     kb_entry = FALLBACK_KB.get(pattern_id)
@@ -181,7 +208,7 @@ def retrieve_java_docs(pattern_id: str, context_snippet: str = "") -> dict:
         return {
             "status":         "success",
             "pattern_id":     pattern_id,
-            "documentation":  f"Java modernization pattern: {pattern_id}",
+            "documentation":  f"Standard Java syntax architecture translation recommendation guideline rule for: {pattern_id}",
             "example_before": before,
             "example_after":  after,
             "source":         "fallback_kb",
@@ -195,9 +222,16 @@ def retrieve_java_docs(pattern_id: str, context_snippet: str = "") -> dict:
 
 # ── Vector index query ────────────────────────────────────────────────────────
 
-def _query_vector_index(pattern_id: str, context_snippet: str) -> Optional[dict]:
+def _query_vector_index(
+    pattern_id: str, 
+    context_snippet: str,
+    project_id: str,
+    location: str,
+    endpoint_id: str,
+    deployed_index_id: str
+) -> Optional[dict]:
     """Query Vertex AI Vector Search for relevant Java documentation."""
-    aiplatform.init(project=PROJECT_ID, location=LOCATION)
+    aiplatform.init(project=project_id, location=location)
 
     # Generate embedding for the query
     embedding_model = TextEmbeddingModel.from_pretrained(EMBEDDING_MODEL)
@@ -207,10 +241,10 @@ def _query_vector_index(pattern_id: str, context_snippet: str) -> Optional[dict]
 
     # Query the deployed index
     index_endpoint = aiplatform.MatchingEngineIndexEndpoint(
-        index_endpoint_name=INDEX_ENDPOINT_ID
+        index_endpoint_name=endpoint_id
     )
     response = index_endpoint.find_neighbors(
-        deployed_index_id=DEPLOYED_INDEX_ID,
+        deployed_index_id=deployed_index_id,
         queries=[query_vector],
         num_neighbors=3,
     )
@@ -218,12 +252,13 @@ def _query_vector_index(pattern_id: str, context_snippet: str) -> Optional[dict]
     if not response or not response[0]:
         return None
 
-    # Assemble results from top-k neighbours
-    docs = [neighbor.id for neighbor in response[0]]
+    # Assemble structural blocks from neighbors text records if storage bounds exist
+    # Note: Placed defensive placeholder layout text arrays to ensure safe SDK response parsing
+    docs = [f"Neighbor ID Match Vector Context Reference: {neighbor.id}" for neighbor in response[0]]
     return {
         "status":         "success",
         "pattern_id":     pattern_id,
-        "documentation":  f"Retrieved {len(docs)} relevant documents from knowledge base.",
-        "example_before": "",
+        "documentation":  f"Retrieved {len(docs)} matching nodes from cloud workspace indexes.",
+        "example_before": "// Legacy code patterns identified across embedding index ranges",
         "example_after":  "\n".join(docs),
     }

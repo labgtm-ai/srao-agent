@@ -1,0 +1,22 @@
+# Python bytecode and caching artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Local Environment dependencies
+.env
+.venv/
+env/
+venv/
+
+# SRAO Agent Temporary Sandboxes and Output Directories
+/tmp/srao_repo_*
+/tmp/srao_output/
+srao_report.json
+srao_report.md
+
+# Application System Module Outputs
+*.class
+target/
+build/

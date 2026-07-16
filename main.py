@@ -1,49 +1,33 @@
 """
 main.py  —  SRAO Agent  v5  ·  google-adk 2.4.0
 =================================================
-
-ROOT CAUSE OF "(Stage 2 completed — agent produced no text summary)"
-─────────────────────────────────────────────────────────────────────
-When Stage 2 was given all 33 findings at once, gemini-2.5-flash tried
-to generate 33 function_call objects in a single response (took 29s).
-The resulting JSON was too large / malformed:
-  finish_reason = MALFORMED_FUNCTION_CALL  →  content = None
-ADK sets content=None on that event.  Our loop:
-  "if not event.content: continue" → skipped it → all_text stayed empty.
-
-THE FIX — batched Stage 2
-──────────────────────────
-Instead of sending all 33 findings to the agent at once, Stage 2 now
-sends files in BATCHES of BATCH_SIZE (default 4) per agent turn.
-Each batch is a separate runner.run() call with a fresh compact prompt.
-4 files per turn = at most ~12 tool calls (retrieve+modernise+validate per file).
-That fits comfortably in one LLM response.
-
-Results are accumulated across all batches into one final report.
-
-ALSO FIXED:
-  - Verbose event logging: finish_reason and error_code are now logged
-    so failures surface immediately rather than silently returning empty.
-  - Each batch turn logs clearly (Batch 1/N, files x-y of total).
+Optimized runner script ensuring strict batch isolation, robust 
+ADK event listening patterns, and automated remote GitHub PR creation.
 """
 
 import os
+# Force Google GenAI SDK to use Vertex AI endpoints
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"]   = "true"
 os.environ["GOOGLE_GENAI_USE_ENTERPRISE"] = "true"
 
 import asyncio
 import logging
 import sys
+import json
 from pathlib import Path
 from dotenv import load_dotenv
+
+# Load variables from .env if present
 load_dotenv()
 
+# Fallback authentication handling for Google Cloud
 if not os.environ.get("GOOGLE_CLOUD_PROJECT"):
     try:
         import google.auth
         _, p = google.auth.default()
         if p: os.environ["GOOGLE_CLOUD_PROJECT"] = p
-    except Exception: pass
+    except Exception:
+        pass
 
 if not os.environ.get("GCP_PROJECT_ID"):
     os.environ["GCP_PROJECT_ID"] = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
@@ -58,7 +42,9 @@ from google.genai.types  import (Content, Part,
 from agents.srao_agent  import srao_agent
 from tools.repo_scanner import scan_repository, list_java_files
 from tools.ast_analyzer import analyze_java_file, classify_severity
+from tools.pr_creator import create_pull_request
 
+# Configure systemic console logging formats
 logging.basicConfig(
     level  = logging.INFO,
     format = "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
@@ -82,6 +68,7 @@ if not PROJECT_ID:
 
 
 def _warn_github():
+    """Validates presence of repository target credentials."""
     missing = [v for v in ["GITHUB_TOKEN","GITHUB_OWNER","GITHUB_REPO"]
                if not os.environ.get(v)]
     if missing:
@@ -99,6 +86,7 @@ _warn_github()
 
 
 def make_run_config() -> RunConfig:
+    """Builds token compression bounds for the underlying ADK Session window."""
     return RunConfig(
         max_llm_calls = 500,
         context_window_compression = ContextWindowCompressionConfig(
@@ -109,6 +97,7 @@ def make_run_config() -> RunConfig:
 
 
 def build_runner() -> InMemoryRunner:
+    """Prepares and instantiates an ADK runtime container session."""
     runner = InMemoryRunner(agent=srao_agent, app_name=APP_NAME)
     asyncio.run(runner.session_service.create_session(
         app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID,
@@ -116,53 +105,60 @@ def build_runner() -> InMemoryRunner:
     return runner
 
 
-def run_agent_turn(runner: InMemoryRunner, user_text: str,
-                   label: str = "") -> str:
+def run_agent_turn(runner: InMemoryRunner, user_text: str, label: str = "") -> list[dict]:
     """
-    Send one message, collect text from ALL events.
-    Now also logs finish_reason and error_code so failures are visible.
+    Send one message, collect text, and capture all successful tool outputs safely.
+    Handles ADK structure variations to prevent dropping modernized code data.
     """
-    message     = Content(role="user", parts=[Part(text=user_text)])
-    all_text    : list[str] = []
-    tool_counts : dict[str, int] = {}
+    message = Content(role="user", parts=[Part(text=user_text)])
+    batch_changes = []
     tag = f"[{label}] " if label else ""
 
     for event in runner.run(
-        user_id=USER_ID, session_id=SESSION_ID,
-        new_message=message, run_config=make_run_config(),
+        user_id=USER_ID, session_id=SESSION_ID, 
+        new_message=message, run_config=RunConfig(max_llm_calls=500)
     ):
-        # ── Log finish_reason / error so failures surface ─────────────────
-        if event.finish_reason and str(event.finish_reason) not in ("FinishReason.STOP",""):
-            logger.warning("%sfinish_reason=%s error_code=%s error_msg=%s",
-                           tag, event.finish_reason,
-                           event.error_code, event.error_message)
-        if event.error_message:
-            logger.error("%sAgent error: %s", tag, event.error_message)
-
-        if not event.content or not event.content.parts:
+        if not event.content or not event.content.parts: 
             continue
-
+            
         for part in event.content.parts:
-            if part.text:
-                all_text.append(part.text)
-            elif hasattr(part, "function_call") and part.function_call:
-                n = part.function_call.name
-                tool_counts[n] = tool_counts.get(n, 0) + 1
-                logger.info("%s[→ tool] %-32s #%d", tag, n, tool_counts[n])
-            elif hasattr(part, "function_response") and part.function_response:
-                logger.info("%s[← tool] %s", tag, part.function_response.name)
+            # Check if this part contains a response back from our modernization tool
+            if hasattr(part, "function_response") and part.function_response:
+                if part.function_response.name == "agent_modernize_code_snippet":
+                    try:
+                        # Extract the raw payload data from the ADK wrapper object
+                        resp_obj = part.function_response.response
+                        
+                        # Fallback 1: If ADK wraps it as a dictionary containing a 'text' or 'content' string
+                        if isinstance(resp_obj, dict):
+                            if "text" in resp_obj:
+                                r_data = json.loads(resp_obj["text"])
+                            elif "content" in resp_obj:
+                                r_data = json.loads(resp_obj["content"])
+                            # Fallback 2: The object is already a pre-parsed target data dictionary
+                            elif "modernised_code" in resp_obj:
+                                r_data = resp_obj
+                            else:
+                                r_data = resp_obj
+                        else:
+                            # Fallback 3: Try reading the attribute directly if it's a structural class object
+                            raw_str = getattr(resp_obj, "text", getattr(resp_obj, "content", "{}"))
+                            r_data = json.loads(raw_str)
 
-    text = "".join(all_text).strip()
-    if text:
-        logger.info("%sTEXT RECEIVED (%d chars)", tag, len(text))
-    else:
-        logger.warning("%sNO TEXT in response (tool_counts=%s)", tag, tool_counts)
-    return text
+                        # Validate and commit to our tracking batch array if structural keys clear
+                        if isinstance(r_data, dict) and "modernised_code" in r_data:
+                            logger.info("%sSuccessfully captured modernized code adjustments payload.", tag)
+                            batch_changes.append(r_data)
+                            
+                    except Exception as parse_err:
+                        logger.warning("%sFailed parsing tool tracking payload item: %s", tag, parse_err)
+                        pass
+                        
+    return batch_changes
 
-
-# ── Stage 1: pure Python, zero LLM ───────────────────────────────────────────
 
 def stage1_scan_and_analyse(repo_url: str, branch: str) -> dict:
+    """Locates and indexes legacy code structural blocks across the filesystem."""
     logger.info("=== STAGE 1: Scanning repository (no LLM) ===")
 
     scan = scan_repository(repo_url, branch)
@@ -212,235 +208,118 @@ def stage1_scan_and_analyse(repo_url: str, branch: str) -> dict:
     }
 
 
-def _build_batch_message(batch_files: list[str],
-                          findings_by_file: dict,
-                          repo_path: str,
-                          repo_url: str,
-                          gh_owner: str,
-                          gh_repo: str,
-                          branch: str,
-                          batch_num: int,
-                          total_batches: int,
-                          is_last: bool,
-                          has_github: bool) -> str:
-    """Build a compact prompt for one batch of files."""
-
-    lines = [
-        f"Batch {batch_num} of {total_batches} — modernise these {len(batch_files)} file(s):",
-        f"Repository: {repo_url}  (local path: {repo_path})",
-        "",
-    ]
-    for fname in batch_files:
-
-        full_path = str(Path(repo_path) / fname)
-
-        lines.append(
-        f"""
-        FILE: {full_path}
-        IMPORTANT:
-        Use this file path when calling tools.
-        Do NOT include full source code in tool arguments.
-        The tool can load the file directly from disk.
-        """
-        )
-
-        for fi in findings_by_file.get(fname, [])[:4]:
-            lines.append(
-                f"  FILE: {full_path}"
-                f"\n    pattern={fi['pattern_id']}  severity={fi['severity']}"
-                f"\n    desc={fi['description']}"
-                f"\n    target={fi['target_java']}"
-            )
-    lines.append("")
-
-    pr_line = (
-        "After processing the files return only a summary "
-        "of the modernization results."
-    ) if is_last else (
-        f"After processing all {len(batch_files)} files above, "
-        "Do not call save_changes_locally."
+def _build_batch_message(batch_files: list[str], findings_by_file: dict) -> str:
+    """Builds a highly structural batch instruction to prevent ADK response blowing up."""
+    batch_data = {}
+    for f in batch_files:
+        batch_data[f] = findings_by_file.get(f, [])
+        
+    prompt = (
+        f"Execute Stage 2 modernization updates on the following targeted batch components:\n"
+        f"{json.dumps(batch_data, indent=2)}\n\n"
+        f"Instructions:\n"
+        f"1. Sequentially call 'agent_modernize_code_snippet' for each target file path.\n"
+        f"2. Do not combine files together into single concurrent execution contexts.\n"
+        f"3. Provide a clear text summary indicating modification statuses once all files are processed."
     )
+    return prompt
 
+
+def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
+    """
+    Executes modernization batch runs sequentially and handles the final automated GitHub PR step.
+    """
+    ordered_files = stage1_data.get("ordered_files", [])
+    findings_by_file = stage1_data.get("findings_by_file", {})
     
-    lines += [
-        "For EACH file:",
-        "1. Call retrieve_java_docs.",
-        "2. Call modernize_code_snippet.",
-        "3. Call validate_diff.",
-        "Use tool calls directly.",
-        "Do NOT generate Python code.",
-        "Do not generate print(default_api...) calls.",
-        "Return only a summary of completed work."
-        "Do NOT write print(default_api.modernize_code_snippet(...)).",
-        "Do NOT write print(default_api.validate_diff(...)).",
-        "Do NOT write print(default_api.save_changes_locally(...)).",
-        "Only retry validation failures.",
-        pr_line,
-        "Return a concise text summary.",
-        "Do NOT call generate_report.",
-        "generate_report will be called once after all batches finish.",
-    ]
+    if not ordered_files:
+        logger.info("No legacy code pattern matches found. Skipping Stage 2 modernization execution.")
+        return
 
-    return "\n".join(lines)
+    total_files = len(ordered_files)
+    logger.info("=== STAGE 2: Modernizing codebases in chunks (Batch Size: %d) ===", BATCH_SIZE)
 
+    all_accumulated_changes = []
 
-# ── Stage 2: batched agent turns ─────────────────────────────────────────────
-
-def stage2_modernise_batched(runner: InMemoryRunner,
-                              stage1: dict,
-                              repo_url: str,
-                              branch: str,
-                              gh_owner: str,
-                              gh_repo: str) -> str:
-    """
-    Process files in batches of BATCH_SIZE.
-    Each batch is one agent turn — at most ~12 tool calls per turn.
-    Keeps the LLM response small to avoid MALFORMED_FUNCTION_CALL.
-    """
-    logger.info("=== STAGE 2: Batched agent modernisation (batch_size=%d) ===",
-                BATCH_SIZE)
-
-    ordered  = stage1["ordered_files"]
-    fby_file = stage1["findings_by_file"]
-    rpath    = stage1["repo_path"]
-    has_gh   = all(os.environ.get(v) for v in
-                   ["GITHUB_TOKEN","GITHUB_OWNER","GITHUB_REPO"])
-
-    # Split into batches
-    batches = [ordered[i:i+BATCH_SIZE]
-               for i in range(0, len(ordered), BATCH_SIZE)]
-    total   = len(batches)
-    summaries: list[str] = []
-
-    for idx, batch in enumerate(batches, start=1):
-        is_last = (idx == total)
-        logger.info("--- Batch %d/%d (%d files) ---", idx, total, len(batch))
-
-        message = _build_batch_message(
-            batch_files      = batch,
-            findings_by_file = fby_file,
-            repo_path        = rpath,
-            repo_url         = repo_url,
-            gh_owner         = gh_owner,
-            gh_repo          = gh_repo,
-            branch           = branch,
-            batch_num        = idx,
-            total_batches    = total,
-            is_last          = is_last,
-            has_github       = has_gh,
+    for i in range(0, total_files, BATCH_SIZE):
+        batch_files = ordered_files[i : i + BATCH_SIZE]
+        batch_num = (i // BATCH_SIZE) + 1
+        total_batches = (total_files + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        label = f"Batch {batch_num}/{total_batches}"
+        logger.info("Processing %s: Target files %d to %d of %d", label, i + 1, min(i + BATCH_SIZE, total_files), total_files)
+        
+        # Build structured tracking prompt payloads
+        batch_chunk_data = {f: findings_by_file.get(f, []) for f in batch_files}
+        prompt = (
+            f"Execute Stage 2 modernization updates on the following targeted batch components:\n"
+            f"{json.dumps(batch_chunk_data, indent=2)}\n\n"
+            f"Instructions:\n"
+            f"1. Sequentially call 'agent_modernize_code_snippet' for each target file path.\n"
+            f"2. Do not combine files together into single concurrent execution contexts.\n"
+            f"3. Provide a clear text summary indicating modification statuses once all files are processed."
         )
+        
+        # Execute turning logic and capture tool payload parameters
+        changes = run_agent_turn(runner, prompt, label=label)
+        
+        if changes:
+            # Inject matching file metrics back into the payload structures
+            for idx, c in enumerate(changes):
+                if idx < len(batch_files):
+                    c["file"] = batch_files[idx]
+                    c["file_path"] = batch_files[idx]
+            all_accumulated_changes.extend(changes)
 
-        result = run_agent_turn(runner, message,
-                                label=f"Batch {idx}/{total}")
+    # ── Trigger Dynamic Git Branch Push and Live Pull Request Activation ──
+    if all_accumulated_changes:
+        logger.info("Batch modernization runs concluded. Initiating pull request operations...")
+        
+        # Inject the absolute sandbox path location pointer into every change element
+        for change in all_accumulated_changes:
+            change["repo_path"] = stage1_data["repo_path"]
 
-        if result:
-            summaries.append(f"### Batch {idx}/{total}\n{result}")
-        else:
-            summaries.append(
-                f"### Batch {idx}/{total}\n"
-                f"⚠ No text response for files: {', '.join(batch)}"
-            )
+        pr_result = create_pull_request(
+            repo_owner=os.environ.get("GITHUB_OWNER", ""),
+            repo_name=os.environ.get("GITHUB_REPO", ""),
+            base_branch="main",
+            changes=all_accumulated_changes
+        )
+        logger.info("Pull request automation output response status: %s", pr_result.get("message"))
+    else:
+        logger.warning("No functional code adjustments were registered during agent execution loops. Skipping PR submission.")
 
-    logger.info("--- Final summary skipped ---")
-
-    return "\n\n".join(summaries) or "(No output generated)"
-
-
-def run_pipeline(runner, repo_url, branch="main", gh_owner="", gh_repo="") -> str:
-    stage1 = stage1_scan_and_analyse(repo_url, branch)
-    if "error" in stage1:
-        return f"Pipeline failed at scan: {stage1['error']}"
-    if not stage1["all_findings"]:
-        return (f"No legacy patterns found in {len(stage1['java_files'])} "
-                "files — already modern!")
-
-    n_batches = -(-len(stage1["ordered_files"]) // BATCH_SIZE)  # ceil division
-    logger.info("Processing %d files in %d batches of %d",
-                len(stage1["ordered_files"]), n_batches, BATCH_SIZE)
-
-    result = stage2_modernise_batched(runner, stage1, repo_url, branch,
-                                       gh_owner, gh_repo)
-    return result or "(Stage 2 completed — agent produced no text summary)"
-
-
-# ── INTERACTIVE ───────────────────────────────────────────────────────────────
-
-def run_interactive():
-    runner = build_runner()
-    print()
-    print("=" * 68)
-    print("  SRAO — Java Modernisation Agent  v5  (ADK 2.4.0)")
-    print(f"  Project : {PROJECT_ID}  |  Location : {LOCATION}")
-    print(f"  Backend : Vertex AI  |  Batch size : {BATCH_SIZE} files/turn")
-    print("  Type 'quit' to exit.")
-    print("=" * 68)
-    if not all(os.environ.get(v) for v in ["GITHUB_TOKEN","GITHUB_OWNER","GITHUB_REPO"]):
-        print()
-        print("  ℹ  No GitHub vars — files saved to /tmp/srao_output/")
-        print("  ℹ  Set GITHUB_TOKEN / GITHUB_OWNER / GITHUB_REPO for auto-PR")
-    print()
-    print("Enter a GitHub repo URL to modernise it end-to-end.")
-    print()
-
-    while True:
-        try:
-            user_input = input("> ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting."); break
-        if not user_input: continue
-        if user_input.lower() in {"quit","exit","q"}: break
-
-        if user_input.startswith(("http://","https://","git@")):
-            branch   = os.environ.get("REPO_BRANCH",  "main")
-            gh_owner = os.environ.get("GITHUB_OWNER", "")
-            gh_repo  = os.environ.get("GITHUB_REPO",  "")
-            print("\n[Stage 1] Scanning & analysing (no LLM)...\n")
-            response = run_pipeline(runner, user_input, branch, gh_owner, gh_repo)
-        else:
-            response = run_agent_turn(runner, user_input)
-
-        print(f"\n{'='*68}\n[Agent Summary]:\n{'='*68}\n{response}\n{'='*68}\n")
-
-
-def run_batch():
-    repo_url = os.environ.get("REPO_URL","")
-    if not repo_url: logger.error("REPO_URL not set"); sys.exit(1)
-    runner = build_runner()
-    print(run_pipeline(runner, repo_url,
-                       branch  =os.environ.get("REPO_BRANCH","main"),
-                       gh_owner=os.environ.get("GITHUB_OWNER",""),
-                       gh_repo =os.environ.get("GITHUB_REPO","")))
-
-
-def create_app():
-    from flask import Flask, request, jsonify
-    fapp, runner = Flask(__name__), build_runner()
-
-    @fapp.route("/health")
-    def health():
-        return jsonify({"status":"ok","version":"5.0",
-                        "project":PROJECT_ID,"batch_size":BATCH_SIZE})
-
-    @fapp.route("/modernise", methods=["POST"])
-    def modernise():
-        d = request.get_json(force=True)
-        if not d.get("repo_url"):
-            return jsonify({"error":"repo_url required"}), 400
-        result = run_pipeline(runner, d["repo_url"],
-                              d.get("branch","main"),
-                              d.get("github_owner",""),
-                              d.get("github_repo",""))
-        return jsonify({"status":"success","result":result})
-
-    return fapp
-
-
-app = create_app() if MODE == "server" else None
 
 if __name__ == "__main__":
-    if MODE == "server":
-        create_app().run(host="0.0.0.0", port=int(os.environ.get("PORT",8080)))
-    elif MODE == "batch":
-        run_batch()
-    else:
-        run_interactive()
+    # Check for core runtime terminal input parameters
+    if len(sys.argv) < 2:
+        logger.error("❌ ERROR: Missing target repository address configuration input parameter.")
+        logger.error("Usage: python main_pipeline.py <repository_url_or_local_path> [branch_name]")
+        sys.exit(1)
+        
+    target_repo = sys.argv[1]
+    target_branch = sys.argv[2] if len(sys.argv) > 2 else "main"
+    
+    logger.info("Initializing multi-agent migration environment sequence loop workflow.")
+    
+    try:
+        # 1. Execute static system analyzer
+        analysis_results = stage1_scan_and_analyse(target_repo, target_branch)
+        
+        if not analysis_results or "error" in analysis_results:
+            logger.error("❌ STAGE 1 SETUP FAILED: %s", analysis_results.get("error", "Unknown initialization failure"))
+            sys.exit(1)
+            
+        # 2. Spin up ADK Agent interface
+        agent_runner = InMemoryRunner(agent=srao_agent, app_name=APP_NAME)
+        asyncio.run(agent_runner.session_service.create_session(
+            app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID
+        ))
+        
+        # 3. Stream tasks systematically to Gemini 2.5 Flash
+        stage2_process_batches(analysis_results, agent_runner)
+        logger.info("Multi-agent enterprise codebase translation process complete.")
+        
+    except Exception as e:
+        logger.exception("❌ CRITICAL PIPELINE CRASH: An unhandled exception stopped execution.")
+        sys.exit(1)

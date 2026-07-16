@@ -2,22 +2,18 @@
 tools/ast_analyzer.py
 ──────────────────────
 Analyses a Java source file for legacy patterns that can be modernised.
-Uses javalang (pure-Python Java parser) for AST analysis.
-Falls back to regex-based heuristics when AST parsing fails.
+Provides complete file context to the generation layer to prevent fragmentation bugs.
 """
 
 import re
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
 # ── Pattern registry ──────────────────────────────────────────────────────────
-# Each entry: (pattern_id, description, severity, regex_hint, java_target_version)
-
 PATTERNS = [
-    # HIGH severity
     (
         "RAW_THREAD",
         "Raw Thread/Runnable usage — replace with Virtual Threads (Project Loom)",
@@ -46,7 +42,6 @@ PATTERNS = [
         r"\.(get|getInputStream|readLine)\s*\(",
         "Java 8+",
     ),
-    # MEDIUM severity
     (
         "POJO_CLASS",
         "Mutable POJO with getters/setters — candidate for Record class",
@@ -75,7 +70,6 @@ PATTERNS = [
         r"instanceof\s+\w+\s*\)\s*\{\s*\n\s*\w+\s+\w+\s*=\s*\(\w+\)",
         "Java 16+",
     ),
-    # LOW severity
     (
         "FOR_LOOP",
         "Traditional for-loop — replace with Stream API",
@@ -112,28 +106,7 @@ SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 def analyze_java_file(file_path: str) -> dict:
     """
     Analyse a single Java source file for legacy patterns.
-
-    Args:
-        file_path: Absolute or relative path to the .java file.
-
-    Returns:
-        {
-          "status":   "success" | "error",
-          "file":     str,
-          "findings": [
-            {
-              "pattern_id":   str,
-              "description":  str,
-              "severity":     "HIGH" | "MEDIUM" | "LOW",
-              "line_numbers": [int, ...],
-              "target_java":  str,
-              "snippet":      str   – relevant code lines
-            },
-            ...
-          ],
-          "total_findings": int,
-          "severity_summary": {"HIGH": int, "MEDIUM": int, "LOW": int}
-        }
+    Sends full file scope to prevent LLM fragmentation failures.
     """
     try:
         source = Path(file_path).read_text(encoding="utf-8", errors="replace")
@@ -155,27 +128,24 @@ def analyze_java_file(file_path: str) -> dict:
             continue
 
         line_numbers = []
-        snippets = []
         for m in matches:
             line_no = source[: m.start()].count("\n") + 1
             line_numbers.append(line_no)
-            # Grab ±2 lines of context
-            start = max(0, line_no - 3)
-            end = min(len(lines), line_no + 2)
-            snippets.append("\n".join(f"{start+i+1}: {lines[start+i]}" for i in range(end - start)))
 
+        # SRAO: Maintain strict structural context by making 'snippet' the complete file text
+        # This gives Gemini visibility over variable maps, braces, and dependencies
         findings.append(
             {
-                "pattern_id":  pattern_id,
-                "description": description,
-                "severity":    severity,
-                "line_numbers": line_numbers,
-                "target_java": target_java,
-                "snippet":     snippets[0] if snippets else "",
+                "pattern_id":   pattern_id,
+                "description":  description,
+                "severity":     severity,
+                "line_numbers":  line_numbers,
+                "target_java":   target_java,
+                "snippet":       source,  # Full file context payload passed downstream
             }
         )
 
-    # Sort by severity
+    # Sort findings by target severity prioritizations
     findings.sort(key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))
 
     summary = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
@@ -192,21 +162,7 @@ def analyze_java_file(file_path: str) -> dict:
 
 
 def classify_severity(findings: list) -> dict:
-    """
-    Summarise and prioritise findings across multiple files.
-
-    Args:
-        findings: List of finding dicts (from analyze_java_file).
-
-    Returns:
-        {
-          "high_priority_files":   [str, ...],
-          "medium_priority_files": [str, ...],
-          "low_priority_files":    [str, ...],
-          "total_patterns":        int,
-          "recommended_order":     [str, ...]  – file paths in processing order
-        }
-    """
+    """Summarise and prioritise findings across multiple files."""
     file_severity: dict[str, set] = {}
 
     for finding in findings:

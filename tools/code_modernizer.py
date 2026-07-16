@@ -9,11 +9,13 @@ Includes a retry loop for CI validation failures.
 import logging
 import os
 import re
+import json
 from typing import Optional
+from pathlib import Path
 
 import vertexai
 from vertexai.generative_models import GenerativeModel, GenerationConfig
-from pathlib import Path
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "your-project-id")
@@ -24,6 +26,7 @@ MAX_RETRIES = 3
 
 # ── Prompt templates ──────────────────────────────────────────────────────────
 
+# SRAO: Escaped literal braces and aligned format variables to guarantee execution safety
 MODERNIZE_PROMPT = """
 You are an expert Java architect specialising in modernising legacy Java code to Java 17/21.
 
@@ -42,15 +45,15 @@ DOCUMENTATION & EXAMPLES:
 {rag_context}
 
 REQUIREMENTS:
-1. Produce ONLY the modernised Java code — no prose, no markdown explanation inside the code block.
+1. Produce ONLY valid Java source code inside the 'modernised_code' structural property.
 2. Preserve the exact method/class signature, access modifiers, and package structure.
 3. Add a brief inline comment (// SRAO: ...) explaining the change on the first modified line.
-4. The refactored code must compile with Java {java_version}.
+4. The refactored code must compile cleanly with Java {java_version}.
 5. Do NOT change unrelated code outside the pattern's scope.
 
-OUTPUT FORMAT — return ONLY this JSON (no markdown fences around the JSON):
+OUTPUT FORMAT — Return your response matching this strict schema structure:
 {{
-  "modernised_code": "<complete refactored code>",
+  "modernised_code": "<complete refactored code with escaped newlines>",
   "explanation":     "<1-2 sentence explanation of what changed and why>",
   "breaking_change": false,
   "imports_added":   ["<fully qualified import if any>"]
@@ -74,7 +77,7 @@ VALIDATION ERROR:
 {validation_error}
 
 Please fix the issue and produce a corrected version.
-Return the same JSON format as before.
+Return your response matching the exact same structural JSON schema as before.
 """
 
 
@@ -113,30 +116,46 @@ def modernize_code_snippet(
     """
     
     vertexai.init(project=PROJECT_ID, location=LOCATION)
+    
+    # SRAO: Explicitly defined structural output schema for Gemini 2.5 Flash to guarantee un-fenced JSON responses
+    response_schema = {
+        "type": "OBJECT",
+        "properties": {
+            "modernised_code": {"type": "STRING", "description": "The complete refactored modern Java code."},
+            "explanation": {"type": "STRING", "description": "A short summary outlining what changes were applied."},
+            "breaking_change": {"type": "BOOLEAN", "description": "True if public method or framework bindings were updated."},
+            "imports_added": {
+                "type": "ARRAY", 
+                "items": {"type": "STRING"}, 
+                "description": "List of fully qualified dependencies introduced by this modernization execution."
+            }
+        },
+        "required": ["modernised_code", "explanation", "breaking_change", "imports_added"]
+    }
+
     model = GenerativeModel(
         MODEL_NAME,
         generation_config=GenerationConfig(
             temperature=0.1,
             top_p=0.95,
-            max_output_tokens=4096,
+            max_output_tokens=8192,  # Increased token threshold to prevent generation truncation on large source files
+            response_mime_type="application/json",
+            response_schema=response_schema
         ),
     )
 
     # Load source from disk if not supplied
     if not legacy_code and file_path:
-
         try:
             legacy_code = Path(file_path).read_text(
                 encoding="utf-8",
                 errors="ignore"
             )
-
             logger.info(
                 "Loaded source from %s (%d chars)",
                 file_path,
                 len(legacy_code),
             )
-
         except Exception as e:
             return {
                 "status": "error",
@@ -149,7 +168,6 @@ def modernize_code_snippet(
         pattern_id,
         len(legacy_code),
     )
-
 
     java_version = _extract_version_number(target_java)
 
@@ -178,7 +196,7 @@ def modernize_code_snippet(
             raw_text  = response.text.strip()
             parsed    = _parse_json_response(raw_text)
 
-            if parsed:
+            if parsed and "modernised_code" in parsed:
                 return {
                     "status":          "success",
                     "modernised_code": parsed.get("modernised_code", ""),
@@ -188,9 +206,9 @@ def modernize_code_snippet(
                     "attempts":        attempt,
                 }
 
-            logger.warning("Attempt %d: could not parse JSON response", attempt)
+            logger.warning("Attempt %d: could not parse clean schema compliant response", attempt)
             previous_attempt  = raw_text
-            validation_error  = "Response was not valid JSON"
+            validation_error  = "Response schema did not contain required modernised_code parameters"
 
         except Exception as exc:
             logger.error("Gemini call failed on attempt %d: %s", attempt, exc)
@@ -207,22 +225,24 @@ def modernize_code_snippet(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _parse_json_response(text: str) -> Optional[dict]:
-    """Extract and parse JSON from the model response."""
-    import json
+    """Extract and parse JSON safely from structured Gemini outputs."""
+    if not text:
+        return None
 
-    # Strip markdown code fences if present
+    # SRAO: Sanitizes markdown fences if Gemini forces text markers into raw blocks
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"```\s*$", "", text, flags=re.MULTILINE).strip()
 
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Try to find a JSON object anywhere in the text
+        # Fallback tracking logic for deep object extractions
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group())
             except json.JSONDecodeError:
+                logger.error("Failed to parse fallback text group string into standard JSON structural format.")
                 pass
     return None
 
