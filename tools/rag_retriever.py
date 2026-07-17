@@ -67,6 +67,30 @@ public class User {
 public record User(String name, int age) {}
 // Usage: var u = new User("Alice", 30); u.name(); u.age();
 """,
+    "MANUAL_MAPPER": """
+// Before (Manual field-to-field setter boilerplate inside mappers)
+public UserDTO convertToDto(User user) {
+    UserDTO dto = new UserDTO();
+    dto.setId(user.getId());
+    dto.setName(user.getName());
+    dto.setEmail(user.getEmail());
+    return dto;
+}
+
+// After (Automated ModelMapper or structural MapStruct component)
+import org.modelmapper.ModelMapper;
+import org.springframework.stereotype.Component;
+
+@Component
+public class UserMapper {
+    private final ModelMapper modelMapper = new ModelMapper();
+
+    public UserDTO convertToDto(User user) {
+        if (user == null) return null;
+        return modelMapper.map(user, UserDTO.class);
+    }
+}
+""",
     "NULL_CHECK": """
 // Before
 String result = null;
@@ -165,7 +189,7 @@ class RagRetriever:
             deployed_index_id=self.deployed_index_id
         )
         
-        # Format the mapping array into an explicit textual markdown instruction context block [2]
+        # Format the mapping array into an explicit textual markdown instruction context block
         if res.get("status") == "success":
             recipe_text = (
                 f"### Migration Recipe for {pattern_id}\n"
@@ -253,7 +277,6 @@ def _query_vector_index(
         return None
 
     # Assemble structural blocks from neighbors text records if storage bounds exist
-    # Note: Placed defensive placeholder layout text arrays to ensure safe SDK response parsing
     docs = [f"Neighbor ID Match Vector Context Reference: {neighbor.id}" for neighbor in response[0]]
     return {
         "status":         "success",

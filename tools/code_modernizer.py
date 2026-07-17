@@ -92,7 +92,7 @@ def modernize_code_snippet(
     validation_error: Optional[str] = None,
 ) -> dict:
     """
-    Generate modernised Java code for a legacy snippet using Gemini.
+    Generate modernised Java code for a legacy snippet using Gemini and write it to disk.
 
     Args:
         file_path:         Path of the source file (for context).
@@ -144,27 +144,35 @@ def modernize_code_snippet(
         ),
     )
 
+    # ── SRAO PATH GUARD REPAIR LAYER ──
+    # Safely handle relative vs absolute sandbox path structures within the Cloud Shell execution root
+    target_path = None
+    if file_path:
+        target_path = Path(file_path)
+        if not target_path.is_absolute():
+            target_path = Path(os.getcwd()) / file_path
+
     # Load source from disk if not supplied
-    if not legacy_code and file_path:
-        try:
-            legacy_code = Path(file_path).read_text(
-                encoding="utf-8",
-                errors="ignore"
-            )
-            logger.info(
-                "Loaded source from %s (%d chars)",
-                file_path,
-                len(legacy_code),
-            )
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Unable to read source file: {e}"
-            }
+        # ── SRAO BACKUP PATH LOADING GATEWAY ──
+    # If legacy_code is empty or missing due to an LLM tool-calling schema bug,
+    # force it to load directly from the absolute file system sandbox path!
+    if not legacy_code or legacy_code.strip() == "":
+        if file_path:
+            try:
+                target_path = Path(file_path)
+                if not target_path.is_absolute():
+                    target_path = Path(os.getcwd()) / file_path
+                
+                if target_path.exists():
+                    legacy_code = target_path.read_text(encoding="utf-8", errors="ignore")
+                    logger.info(f"🔄 SRAO Recovery: Tool parameter was empty. Successfully recovered code from disk ({len(legacy_code)} chars)")
+            except Exception as e:
+                logger.error(f"❌ SRAO Recovery Failed: Unable to read file from disk: {e}")
+
 
     logger.info(
         "Modernizer input: file=%s pattern=%s code_length=%d",
-        file_path,
+        str(target_path) if target_path else file_path,
         pattern_id,
         len(legacy_code),
     )
@@ -173,7 +181,7 @@ def modernize_code_snippet(
 
     for attempt in range(1, MAX_RETRIES + 1):
         logger.info("Modernising %s — pattern %s — attempt %d/%d",
-                    file_path, pattern_id, attempt, MAX_RETRIES)
+                    str(target_path) if target_path else file_path, pattern_id, attempt, MAX_RETRIES)
 
         if attempt == 1 or not previous_attempt:
             prompt = MODERNIZE_PROMPT.format(
@@ -197,9 +205,23 @@ def modernize_code_snippet(
             parsed    = _parse_json_response(raw_text)
 
             if parsed and "modernised_code" in parsed:
+                generated_java_code = parsed.get("modernised_code", "")
+                
+                # ── SRAO WRITE BLOCK LAYER ──
+                # This explicitly overwrites the modified code string directly to the target file path location on disk.
+                if target_path and generated_java_code:
+                    try:
+                        # Ensure any parent folders exist, though they should in a cloned repo layout
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        target_path.write_text(generated_java_code, encoding="utf-8")
+                        logger.info("💾 SRAO Disk Writer: Successfully applied refactoring modifications to disk: %s", str(target_path))
+                    except Exception as disk_err:
+                        logger.error("❌ SRAO Disk Writer failed to commit file updates: %s", disk_err)
+                        return {"status": "error", "message": f"File write failure on disk: {disk_err}", "attempts": attempt}
+
                 return {
                     "status":          "success",
-                    "modernised_code": parsed.get("modernised_code", ""),
+                    "modernised_code": generated_java_code,
                     "explanation":     parsed.get("explanation", ""),
                     "breaking_change": parsed.get("breaking_change", False),
                     "imports_added":   parsed.get("imports_added", []),
@@ -221,7 +243,6 @@ def modernize_code_snippet(
         "attempts": MAX_RETRIES,
     }
 
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _parse_json_response(text: str) -> Optional[dict]:
@@ -239,11 +260,40 @@ def _parse_json_response(text: str) -> Optional[dict]:
         # Fallback tracking logic for deep object extractions
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
+            matched_text = match.group()
             try:
-                return json.loads(match.group())
+                return json.loads(matched_text)
             except json.JSONDecodeError:
-                logger.error("Failed to parse fallback text group string into standard JSON structural format.")
-                pass
+                # ── SRAO REPAIR LAYER: Handle literal unescaped characters in source code string payloads ──
+                try:
+                    # 1. Isolate the modernized code string value directly between property boundary anchors
+                    code_match = re.search(r'"modernised_code"\s*:\s*"(.*?)"\s*,\s*"explanation"', matched_text, re.DOTALL)
+                    if code_match:
+                        raw_captured_code = code_match.group(1)
+                        
+                        # 2. Repair common string literal escaping defects
+                        # Replaces literal raw newlines with escaped sequences so json.loads stays happy
+                        repaired_text = matched_text.replace(raw_captured_code, raw_captured_code.replace("\n", "\\n"))
+                        return json.loads(repaired_text)
+                except Exception:
+                    pass
+                
+                # Ultimate manual extraction fallback route if standard parsing fails completely
+                logger.error("Failed to parse fallback text group string into standard JSON structural format. Initiating key extraction fallback.")
+                try:
+                    # Manually split out the code content to bypass JSON serialization problems
+                    code_block = matched_text.split('"modernised_code":')[1].split('"explanation":')[0].strip().strip(',').strip('"')
+                    # Fix escaped newlines and double quote characters
+                    final_code = code_block.replace('\\n', '\n').replace('\\"', '"')
+                    return {
+                        "modernised_code": final_code,
+                        "explanation": "Extracted via backup string token isolation mechanics.",
+                        "breaking_change": False,
+                        "imports_added": []
+                    }
+                except Exception:
+                    logger.error("❌ Ultimate parsing fallback failed.")
+                    
     return None
 
 

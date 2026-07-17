@@ -3,6 +3,7 @@ tools/ast_analyzer.py
 ──────────────────────
 Analyses a Java source file for legacy patterns that can be modernised.
 Provides complete file context to the generation layer to prevent fragmentation bugs.
+Filters rules dynamically using version compliance thresholds and architectural package context.
 """
 
 import re
@@ -12,7 +13,8 @@ from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
-# ── Pattern registry ──────────────────────────────────────────────────────────
+# ── Pattern registry with Minimum Version Requirements ────────────────────────
+# Structure: (pattern_id, description, severity, regex, target_java, min_required_version)
 PATTERNS = [
     (
         "RAW_THREAD",
@@ -20,6 +22,7 @@ PATTERNS = [
         "HIGH",
         r"\bnew\s+Thread\s*\(|implements\s+Runnable\b",
         "Java 21",
+        21, 
     ),
     (
         "SYNCHRONIZED_BLOCK",
@@ -27,6 +30,7 @@ PATTERNS = [
         "HIGH",
         r"\bsynchronized\s*[\(\{]",
         "Java 21",
+        21, 
     ),
     (
         "BLOCKING_SLEEP",
@@ -34,20 +38,32 @@ PATTERNS = [
         "HIGH",
         r"Thread\.sleep\s*\(",
         "Java 8+",
+        8,  
     ),
+        # Change ONLY this pattern row inside the PATTERNS registry array:
     (
         "COMPLETABLE_FUTURE_MISSING",
-        "Blocking I/O in service layer — wrap with CompletableFuture",
+        "Blocking streaming I/O in layer — wrap with CompletableFuture handles",
         "HIGH",
-        r"\.(get|getInputStream|readLine)\s*\(",
+        r"\.(getInputStream|getReader|readLine|readAllBytes)\s*\(", # SRAO FIX: Removed plain .get to prevent List.get() false positives
         "Java 8+",
+        8,  
+    ),
+    (
+        "MANUAL_MAPPER",
+        "Manual boilerplate object mapping detected — replace with MapStruct or automated ModelMapper components",
+        "MEDIUM",
+        r"(\w+)\.set(\w+)\s*\(\s*\w+\.get\2\s*\(\s*\)\s*\)",
+        "Java 8+",
+        8, # Detects structural patterns like userDto.setName(user.getName()) inside data mapping blocks
     ),
     (
         "POJO_CLASS",
-        "Mutable POJO with getters/setters — candidate for Record class",
+        "Mutable POJO with getters/setters — candidate for immutable Record class",
         "MEDIUM",
         r"private\s+\w+\s+\w+\s*;\s*\n.*public\s+\w+\s+get\w+\s*\(\s*\)",
         "Java 16+",
+        16, # Java Records finalized in JDK 16 (Dynamic gate restriction)
     ),
     (
         "NULL_CHECK",
@@ -55,6 +71,7 @@ PATTERNS = [
         "MEDIUM",
         r"if\s*\(\s*\w+\s*==\s*null\s*\)|if\s*\(\s*null\s*==\s*\w+\s*\)",
         "Java 8+",
+        8,  
     ),
     (
         "RAW_TYPE",
@@ -62,6 +79,7 @@ PATTERNS = [
         "MEDIUM",
         r"\b(List|Map|Set|Collection|ArrayList|HashMap|HashSet)\s+\w+\s*=\s*new\s+\1\s*\(\)",
         "Java 8+",
+        8,  
     ),
     (
         "INSTANCEOF_CAST",
@@ -69,6 +87,7 @@ PATTERNS = [
         "MEDIUM",
         r"instanceof\s+\w+\s*\)\s*\{\s*\n\s*\w+\s+\w+\s*=\s*\(\w+\)",
         "Java 16+",
+        16, 
     ),
     (
         "FOR_LOOP",
@@ -76,6 +95,7 @@ PATTERNS = [
         "LOW",
         r"\bfor\s*\(\s*(int\s+\w+\s*=\s*0|\w+\s+\w+\s*:\s*\w+)",
         "Java 8+",
+        8,  
     ),
     (
         "STRING_CONCAT",
@@ -83,6 +103,7 @@ PATTERNS = [
         "LOW",
         r'(\w+)\s*\+=\s*"',
         "Java 8+",
+        8,  
     ),
     (
         "STRING_BUFFER",
@@ -90,6 +111,7 @@ PATTERNS = [
         "LOW",
         r"\bnew\s+StringBuffer\s*\(",
         "Java 8+",
+        8,  
     ),
     (
         "MULTILINE_STRING",
@@ -97,16 +119,17 @@ PATTERNS = [
         "LOW",
         r'"[^"]*\\n[^"]*"\s*\+\s*"',
         "Java 15+",
+        15, 
     ),
 ]
 
 SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 
 
-def analyze_java_file(file_path: str) -> dict:
+def analyze_java_file(file_path: str, target_version: int) -> dict:
     """
-    Analyse a single Java source file for legacy patterns.
-    Sends full file scope to prevent LLM fragmentation failures.
+    Analyse a single Java source file for legacy patterns up to target_version.
+    Includes a fast-pass short circuit for pure boilerplate POJO/DTO data holders.
     """
     try:
         source = Path(file_path).read_text(encoding="utf-8", errors="replace")
@@ -115,10 +138,55 @@ def analyze_java_file(file_path: str) -> dict:
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
-    lines = source.splitlines()
     findings = []
+    
+    # Check if the file path indicates a data object (DTO, Request, Response, Entity)
+    normalized_path = file_path.lower().replace("\\", "/")
+    is_data_object = any(token in normalized_path for token in ["/dto/", "/request", "/response", "/entity"])
 
-    for pattern_id, description, severity, regex, target_java in PATTERNS:
+    # ── POJO/DTO FAST-PASS SHORT CIRCUIT ──
+    # If it's a data object, check if it's a pure boilerplate bean (private fields + getters/setters)
+    if is_data_object and target_version >= 16:
+        has_pojo_pattern = re.search(r"private\s+\w+\s+\w+\s*;\s*\n.*public\s+\w+\s+get\w+\s*\(\s*\)", source)
+        
+        # Check if it lacks service annotations or complex business logic markers
+        is_pure_bean = not any(marker in source for marker in ["@Service", "@Controller", "@Autowired", "Repository", "ExecutorService"])
+        
+        if has_pojo_pattern and is_pure_bean:
+            logger.info(f"⚡ Fast-Pass Triggered: Isulating exclusive Record upgrade for pure data bean: {file_path}")
+            
+            # Find line number for the class fields/getters to show a clean log anchor
+            line_no = source[:has_pojo_pattern.start()].count("\n") + 1
+            
+            return {
+                "status": "success",
+                "file": file_path,
+                "findings": [{
+                    "pattern_id": "POJO_CLASS",
+                    "description": "Mutable POJO with getters/setters — candidate for immutable Record class",
+                    "severity": "MEDIUM",
+                    "line_numbers": [line_no],
+                    "target_java": "Java 16+",
+                    "snippet": source
+                }],
+                "total_findings": 1,
+                "severity_summary": {"HIGH": 0, "MEDIUM": 1, "LOW": 0}
+            }
+
+    # ── STANDARD MULTI-PATTERN EVALUATION LOOPS ──
+    # (If the file isn't a pure bean, it falls through to check everything normally as before)
+    is_mapper_class = "mapper" in normalized_path
+
+    for pattern_id, description, severity, regex, target_java, min_required_version in PATTERNS:
+        if min_required_version > target_version:
+            continue
+
+        if is_data_object and pattern_id in ["COMPLETABLE_FUTURE_MISSING", "RAW_THREAD", "SYNCHRONIZED_BLOCK", "BLOCKING_SLEEP"]:
+            continue
+
+        if pattern_id == "MANUAL_MAPPER" and not is_mapper_class:
+            continue
+
         try:
             matches = list(re.finditer(regex, source, re.MULTILINE))
         except re.error:
@@ -127,25 +195,17 @@ def analyze_java_file(file_path: str) -> dict:
         if not matches:
             continue
 
-        line_numbers = []
-        for m in matches:
-            line_no = source[: m.start()].count("\n") + 1
-            line_numbers.append(line_no)
+        line_numbers = [source[: m.start()].count("\n") + 1 for m in matches]
 
-        # SRAO: Maintain strict structural context by making 'snippet' the complete file text
-        # This gives Gemini visibility over variable maps, braces, and dependencies
-        findings.append(
-            {
-                "pattern_id":   pattern_id,
-                "description":  description,
-                "severity":     severity,
-                "line_numbers":  line_numbers,
-                "target_java":   target_java,
-                "snippet":       source,  # Full file context payload passed downstream
-            }
-        )
+        findings.append({
+            "pattern_id":   pattern_id,
+            "description":  description,
+            "severity":     severity,
+            "line_numbers":  line_numbers,
+            "target_java":   target_java,
+            "snippet":       source,  
+        })
 
-    # Sort findings by target severity prioritizations
     findings.sort(key=lambda f: SEVERITY_ORDER.get(f["severity"], 9))
 
     summary = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
@@ -159,6 +219,7 @@ def analyze_java_file(file_path: str) -> dict:
         "total_findings":   len(findings),
         "severity_summary": summary,
     }
+
 
 
 def classify_severity(findings: list) -> dict:

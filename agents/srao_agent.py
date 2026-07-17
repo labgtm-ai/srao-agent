@@ -36,11 +36,11 @@ def agent_modernize_code_snippet(
     pattern_id: str,
     description: str,
     target_java: str,
-    rag_context: str
+    rag_context: str,
+    legacy_code: str # ── NEW SRAO FIX: Accept the code directly from the LLM context
 ) -> dict:
     """
     Generate modernized Java source code for a specific file and architectural pattern match.
-    The source code is loaded automatically from disk using the provided file_path.
     
     Args:
         file_path: Relative or absolute path targeting the Java source file on disk.
@@ -48,13 +48,14 @@ def agent_modernize_code_snippet(
         description: Informational statement outlining the modernization objective.
         target_java: The target Java baseline specification version (e.g., 'Java 17', 'Java 21').
         rag_context: Valid migration recipes or structural documentation blocks fetched from RAG.
+        legacy_code: The original legacy Java code source string passed directly from agent context memory.
     """
-    # Force legacy code parameter to empty so the engine reads the complete file directly from the filesystem path
+    # Forward the live legacy_code string straight to the modernizer tool
     return modernize_code_snippet(
         file_path=file_path,
         description=description,
         target_java=target_java,
-        legacy_code="", 
+        legacy_code=legacy_code, # Enforces memory passing instead of container disk lookups
         pattern_id=pattern_id,
         rag_context=rag_context
     )
@@ -94,6 +95,8 @@ Call 'agent_modernize_code_snippet' with these parameters:
   - description: The text description string.
   - target_java: The target Java runtime parameter.
   - rag_context: The precise markdown instruction recipe text returned from STEP 1.
+  - legacy_code: The COMPLETE source text of the file you are currently modernizing. Do not truncate it.
+
 
 CRITICAL OPERATIONAL CONSTRAINTS FOR STEP 2:
   - The tool reads file content directly from 'file_path'. Do not attempt to guess or pass arbitrary snippet content strings.
@@ -116,6 +119,11 @@ DO NOT INVOLVE SEPARATE PIPELINE SUB-TASKS OUTSIDE THOSE DELIBERATELY REGISTERED
 
 PROCESSING SEVERITY PRIORITY TRACK ROUTING RULES:
   - You must iterate over and address high severity patterns ('HIGH') before applying changes to 'MEDIUM' or 'LOW' risk profile items. Do not truncate execution loops early.
+
+── AUTHORIZED SYSTEM COMPLIANCE OVERRIDES ──
+  - You have FULL PERMISSION to refactor code inside 'synchronized' blocks and synchronized methods.
+  - Replacing a local method 'StringBuffer' variable with a 'StringBuilder' is explicitly safe and does NOT violate synchronization boundaries.
+  - Flattening legacy loops/iterators into native Java Streams inside a synchronized block is completely safe and authorized. Do not skip these patterns.
 """
 
 # ── Instantiate Consolidated ADK Agent Runtime Definition ───────────────────
