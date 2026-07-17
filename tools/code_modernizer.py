@@ -202,6 +202,12 @@ def modernize_code_snippet(
         try:
             response  = model.generate_content(prompt)
             raw_text  = response.text.strip()
+
+            # ── NEW SRAO LIVE DEBUG PRINT DUMP ──
+            print(f"\n====================================================")
+            print(f"🔮 DEBUG: Raw Gemini Response for {pattern_id} (Attempt {attempt}):")
+            print(raw_text[:1500]) # Prints the first 1500 characters of the raw json response
+            print("====================================================\n")
             parsed    = _parse_json_response(raw_text)
 
             if parsed and "modernised_code" in parsed:

@@ -236,98 +236,6 @@ def save_changes_locally(changes: List[Dict], output_dir: str = "/tmp/srao_outpu
         dest.write_text(code, encoding="utf-8")
     return {"status": "success", "output_dir": str(out)}
 
-def create_pull_request(repo_owner: str, repo_name: str, base_branch: str, changes: List[Dict]) -> dict:
-    """
-    Executes actual Git operations, applies file updates to disk,
-    pushes a time-scoped feature branch upstream, and creates a GitHub Pull Request.
-    """
-    token = os.environ.get("GITHUB_TOKEN", GITHUB_TOKEN)
-    raw_owner = repo_owner or os.environ.get("GITHUB_OWNER", "")
-    raw_repo  = repo_name  or os.environ.get("GITHUB_REPO",  "")
-    
-    if not token or not raw_owner or not raw_repo or not changes: 
-        return save_changes_locally(changes)
-    
-    # ── URL SANITIZATION ──
-    def clean_slug(s: str) -> str:
-        s = s.replace("https://", "").replace("http://", "").replace("github.com", "")
-        s = s.strip("/").replace(".git", "")
-        return s.split("/")[-1] if "/" in s else s
-
-    owner = clean_slug(raw_owner)
-    repo  = clean_slug(raw_repo)
-    
-    # ── REPOSITORY PATH DISCOVERY ──
-    paths = sorted(list(Path("/tmp").glob("srao_repo_*")), key=os.path.getmtime)
-    if not paths:
-        return {"status": "error", "message": "No valid git repository path found in /tmp"}
-    local_repo_path = str(paths[-1])
-    
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    feature_branch = f"srao/modernized_code_{ts}"
-    
-    try:
-        logger.info(f"Purging remote cache configurations in sandbox path: {local_repo_path}")
-        
-        # Configure local git actor identity
-        subprocess.run(["git", "config", "user.name", "SRAO Agent"], cwd=local_repo_path, check=True)
-        subprocess.run(["git", "config", "user.email", "srao@google.com"], cwd=local_repo_path, check=True)
-        
-        # ── APPLY CHANGES TO FILESYSTEM (FIXED BUG) ──
-        for change in changes:
-            file_path = change.get("file_path")
-            new_content = change.get("content")  # Assuming your change dict provides the code asset
-            if file_path and new_content:
-                full_path = Path(local_repo_path) / file_path
-                full_path.parent.mkdir(parents=True, exist_ok=True)
-                full_path.write_text(new_content, encoding="utf-8")
-        
-        # ── REMOTE MANAGEMENT ──
-        subprocess.run(["git", "remote", "remove", "origin"], cwd=local_repo_path, capture_output=True)
-        
-        authenticated_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
-        logger.info(f"Registering pristine upstream remote origin path track: https://github.com/{owner}/{repo}.git")
-        subprocess.run(["git", "remote", "add", "origin", authenticated_url], cwd=local_repo_path, check=True)
-        
-        # Checkout branch, stage files, and commit
-        subprocess.run(["git", "checkout", "-b", feature_branch], cwd=local_repo_path, check=True)
-        subprocess.run(["git", "add", "."], cwd=local_repo_path, check=True)
-        subprocess.run(["git", "commit", "-m", "chore: modernized java assets via multi-agent pipeline"], cwd=local_repo_path, check=True)
-        
-        logger.info(f"Pushing time-scoped feature branch '{feature_branch}' upstream...")
-        subprocess.run(["git", "push", "-u", "origin", feature_branch], cwd=local_repo_path, check=True)
-        
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Git execution failed: {e.stderr if hasattr(e, 'stderr') else str(e)}")
-        return {"status": "error", "message": f"Git sub-process failure: {str(e)}"}
-    except Exception as e: 
-        logger.error(f"Git operation block failed: {str(e)}")
-        return {"status": "error", "message": f"Git fail: {str(e)}"}
-    
-    # ── PULL REQUEST CREATION ──
-    details = "\n".join([f"- **{c.get('file_path','unknown')}**: {c.get('explanation','Refactored.')}" for c in changes])
-    payload = {
-        "title": f"[SRAO] Java Modernization: {len(changes)} files refactored", 
-        "body": f"### AI Modernization\n\n{details}", 
-        "head": feature_branch, 
-        "base": base_branch
-    }
-    
-    res = requests.post(
-        f"{GITHUB_API_URL}/repos/{owner}/{repo}/pulls", 
-        json=payload, 
-        headers={
-            "Authorization": f"token {token}", 
-            "Accept": "application/vnd.github.v3+json"
-        }
-    )
-    
-    if res.status_code in (200, 201): 
-        return {"status": "success", "pr_url": res.json()["html_url"], "message": "PR created"}
-    
-    return {"status": "error", "message": res.text}
-
-
 class CodeModernizer:
     def __init__(self):
         schema = {
@@ -468,9 +376,16 @@ def stage1_scan_and_analyse(repo_url: str, branch: str, target_version: int) -> 
 
 def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
     """
-    Sequentially loops through workspace files one-by-one, and processes EACH 
-    pattern inside that file isolated from others to guarantee maximum recovery rates.
+    Sequentially loops through workspace files one-by-one, bypassing multi-agent 
+    tool session loops to call the modernization engine directly as a deterministic service.
     """
+    from tools.code_modernizer import modernize_code_snippet
+    from tools.rag_retriever import RagRetriever
+    # Look for your existing repo_scanner import line and make sure it brings in run_compile_validation
+    from tools.repo_scanner import run_compile_validation, clean_backup_files, revert_file_changes
+    from tools.pr_creator import create_pull_request
+
+
     ordered_files = stage1_data.get("ordered_files", [])
     findings_by_file = stage1_data.get("findings_by_file", {})
     repo_root = stage1_data["repo_path"]
@@ -480,10 +395,11 @@ def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
         return
 
     total_files = len(ordered_files)
-    logger.info("=== STAGE 2: Modernizing codebases sequentially (Pattern Isolated Loops) ===")
+    logger.info("=== STAGE 2: Modernizing codebases sequentially (Direct Service Architecture) ===")
 
     global ACCUMULATED_CHANGES_CACHE
     ACCUMULATED_CHANGES_CACHE = []
+    retriever = RagRetriever()
     
     for i, target_file in enumerate(ordered_files):
         file_findings = findings_by_file.get(target_file, [])
@@ -493,63 +409,39 @@ def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
         logger.info(f"⏳ Processing target module [{i+1}/{total_files}]: {target_file} ({len(file_findings)} patterns found)")
         
         full_path = Path(repo_root) / target_file
-        file_originally_changed = False
-        
-        # Capture baseline content of the file before *any* pattern loops run
         baseline_code_content = full_path.read_text(encoding="utf-8") if full_path.exists() else ""
+        file_originally_changed = False
 
-        # ── NEW: ITERATE OVER EACH DATA PATTERN ISOLATED FOR MAXIMUM RESILIENCE ──
+        # Process each pattern sequentially as an isolated structural delta pass
         for p_idx, finding in enumerate(file_findings):
             pattern_id = finding.get("pattern_id", "MODERNIZE")
-            logger.info(f"   ↳ [Pattern {p_idx+1}/{len(file_findings)}] Evaluating rule: {pattern_id}")
+            description = finding.get("description", "Refactor legacy architecture.")
+            target_java = finding.get("target_java", "Java 17/21")
             
-            # Read the current state of the file on disk (which might contain edits from a previous pass)
+            logger.info(f"   ↳ [Pattern {p_idx+1}/{len(file_findings)}] Executing direct modernization for: {pattern_id}")
+            
+            # Read current disk state (picks up edits from a previous pass)
             original_code_content = full_path.read_text(encoding="utf-8") if full_path.exists() else ""
             
-            # Construct a tight payload assignment targeting ONLY this specific pattern loop pass
-            payload = {
-                "assignment_timestamp": datetime.now(timezone.utc).isoformat(),
-                "target_file_path": str(full_path),
-                "findings": [finding] # Isolate to EXACTLY one pattern element
-            }
+            # Fetch the precise migration recipe from your RAG knowledge base
+            rag_context = retriever.get_migration_recipe(pattern_id, original_code_content)
             
-            prompt = (
-                f"Process isolated pattern assignment target object:\n"
-                f"{json.dumps(payload)}\n\n"
-                f"Instructions: Refactor the file on disk ONLY for this specific pattern. "
-                f"If you cannot safely apply this specific rule, output 'failed' and do not touch the file."
+            # ── CRITICAL FIX: CALL THE MODERNIZATION ENGINE DIRECTLY AS A SERVICE ──
+            # This completely bypasses the ADK session layer, forcing the file to load, refactor, and write to disk
+            result = modernize_code_snippet(
+                file_path=str(full_path),
+                description=description,
+                target_java=target_java,
+                legacy_code=original_code_content,
+                pattern_id=pattern_id,
+                rag_context=rag_context
             )
             
-            dynamic_session_id = f"srao-session-{target_file.replace('/', '_').replace('.', '_')}-{pattern_id}"
-            
-            try:
-                # Register a clean, pristine runtime session for this specific pattern pass
-                asyncio.run(runner.session_service.create_session(
-                    app_name=APP_NAME, user_id=USER_ID, session_id=dynamic_session_id
-                ))
-                
-                agent_response_text = run_agent_turn(runner, prompt, label=f"{target_file}_{pattern_id}")
-                lower_response = agent_response_text.lower()
-                
-                                # ── SRAO UNBLOCKED ERROR CHECKING LAYER ──
-                # We removed the generic 'failed' text check to prevent false-positive skips on silent agent runs.
-                if '"breaking_change": true' in lower_response or "unable to modernize" in lower_response:
-                    logger.warning(f"     ⚠️ Skipping rule {pattern_id}: Agent reported an explicit breaking change constraint. Moving to next rule.")
-                    # Revert file to what it was right before this specific loop turn started
-                    full_path.write_text(original_code_content, encoding="utf-8")
-                    continue
-                    
-            except Exception as turn_err:
-                logger.error(f"     ❌ Tool exception during pattern pass: {turn_err}")
-                full_path.write_text(original_code_content, encoding="utf-8")
-                continue
-                
-            # Check disk adjustments immediately for this individual pattern turn
-            if full_path.exists():
+            if result.get("status") == "success":
                 current_code_content = full_path.read_text(encoding="utf-8")
                 
                 if current_code_content != original_code_content:
-                    # Run quick local compiler validation to verify the specific rule change didn't break things
+                    # Run targeted compilation check instantly
                     compiled_ok, compile_log = run_compile_validation(repo_root, target_file)
                     
                     if compiled_ok:
@@ -558,14 +450,14 @@ def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
                         clean_backup_files(repo_root, target_file)
                     else:
                         logger.warning(f"     ⚠️ Pattern {pattern_id} failed compilation. Rolling back this specific rule.")
-                        logger.warning(f"     Error Detail: {compile_log[:300]}")
                         full_path.write_text(original_code_content, encoding="utf-8")
+            else:
+                logger.error(f"     ❌ Modernizer failed to process pattern {pattern_id}: {result.get('message')}")
 
         # ── POST-FILE ANALYSIS TRACKING ──
         if full_path.exists():
             final_file_content = full_path.read_text(encoding="utf-8")
             
-            # If the file passed ANY of our pattern checks, add it to the final PR bundle cache
             if file_originally_changed and final_file_content != baseline_code_content:
                 logger.info(f"✅ Target module modernization SUCCESSFUL: {target_file} saved to cache.")
                 ACCUMULATED_CHANGES_CACHE.append({
@@ -573,10 +465,11 @@ def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
                     "file": target_file,
                     "modernised_code": final_file_content,
                     "repo_path": repo_root,
+                    "target_version": target_java_version, 
                     "explanation": "Refactored legacy Java pattern implementation structures dynamically."
                 })
             else:
-                logger.info(f"➖ Workspace Unchanged for: {target_file} (No safe compilation edits were retained.)")
+                logger.info(f"➖ Workspace Unchanged for: {target_file} (No compilation edits were retained.)")
 
     # ── COMPREHENSIVE PROJECT VALIDATION GATES ──
     if ACCUMULATED_CHANGES_CACHE:
@@ -587,7 +480,7 @@ def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
             logger.error(f"🛑 CRITICAL BUILD BLOCKER: Global compilation failed.\n{build_log[:1200]}")
             return
             
-        boot_ok, boot_log = run_spring_boot_validation(repo_root)
+        boot_ok, boot_log = run_springboot_boot_check(repo_root)
         if not boot_ok:
             logger.error(f"🛑 CRITICAL RUNTIME BLOCKER: Application failed to boot cleanly.\n{boot_log}")
             return
@@ -602,7 +495,6 @@ def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
         logger.info(f"✨ Modernization Workflow Successful! Destination URL: {pr_result.get('pr_url', pr_result.get('message'))}")
     else:
         logger.warning("No functional code adjustments cleared compilation checks. Skipping PR submission.")
-
 
 
 if __name__ == "__main__":
@@ -651,13 +543,15 @@ if __name__ == "__main__":
             target_java_version = 21
 
     # --- Automatically Extract Slug Context details from the input URL ---
+        # --- Automatically Extract Slug Context details from the input URL ---
     if "github.com" in target_repo:
-        # Splits 'https://github.com' structure safely
-        url_parts = target_repo.rstrip("/").replace(".git", "").split("://github.com")
+        # SRAO FIX: Clean out protocol headers and trailing components cleanly
+        clean_url = target_repo.replace("https://", "").replace("http://", "").replace(".git", "").rstrip("/")
+        url_parts = clean_url.split("://github.com")
         if len(url_parts) > 1:
-            slug_parts = url_parts[1].strip("/").split("/")
+            slug_parts = url_parts[1].split("/")
             if len(slug_parts) >= 2:
-                # Dynamically override the configuration parameters based on input details
+                # Safely assign parameters directly into active environment fields
                 os.environ["GITHUB_OWNER"] = slug_parts[0]
                 os.environ["GITHUB_REPO"]  = slug_parts[1]
 

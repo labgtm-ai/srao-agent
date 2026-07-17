@@ -1,6 +1,6 @@
 GCP_PROJECT_ID=deutschebank-aipocs
 GCP_LOCATION=us-central1
-GITHUB_TOKEN=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
+GITHUB_TOKEN=
 GITHUB_OWNER=labgtm-ai
 GITHUB_REPO=java-legacy-enterprise-app
 VECTOR_INDEX_ENDPOINT_ID=

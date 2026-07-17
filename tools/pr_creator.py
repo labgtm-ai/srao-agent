@@ -24,7 +24,8 @@ logger = logging.getLogger("srao.pr_creator")
 GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_API_URL = "https://github.com"
 
-PR_TITLE = "[SRAO] Java modernisation: {n} file(s) refactored to Java 17/21"
+# SRAO FIX: Shifted target version from hardcoded strings to an evaluation template token slot
+PR_TITLE = "[SRAO] Java modernization: {n} file(s) refactored to Java {target_version}"
 PR_BODY  = """## 🤖 AI-Powered Java Modernisation (SRAO Agent)
 
 Generated automatically by the **SRAO Agent** on Google Cloud Vertex AI.
@@ -35,7 +36,7 @@ Generated automatically by the **SRAO Agent** on Google Cloud Vertex AI.
 |---|---|
 | **Files modified** | {file_count} |
 | **Patterns addressed** | {patterns} |
-| **Target Java version** | Java 17/21 |
+| **Target Java version** | Java {target_version} |
 | **Dynamic Source Branch** | `{branch_name}` |
 
 ### Changes Applied
@@ -43,7 +44,7 @@ Generated automatically by the **SRAO Agent** on Google Cloud Vertex AI.
 
 ### Review Checklist
 - [ ] Check inline `// SRAO:` comments for change explanations
-- [ ] Run `mvn test` / `gradle test` locally to ensure green builds
+- [ ] Run compilation and verify application readiness locally
 - [ ] Review any `breaking_change: true` flags carefully
 
 *Model: Gemini 2.5 Flash · Agent: SRAO Multi-Agent Suite v6*
@@ -129,130 +130,125 @@ def save_changes_locally(changes: List[Dict[str, Any]], output_dir: str = "/tmp/
     }
 
 
-def create_pull_request(
-    repo_owner: str,
-    repo_name:  str,
-    base_branch: str,
-    changes: List[Dict[str, Any]],
-    project_id: str = "",
-) -> dict:
+def create_pull_request(repo_owner: str, repo_name: str, base_branch: str, changes: List[Dict]) -> dict:
     """
-    Executes actual Git operations against the sandboxed repository on disk, 
+    Executes actual Git operations, applies file updates to disk,
     pushes a time-scoped feature branch upstream, and creates a GitHub Pull Request.
     """
+    global GITHUB_API_URL  # ── FIX 2: Explicitly bind the global API endpoint token URL
+    
     token = os.environ.get("GITHUB_TOKEN", GITHUB_TOKEN)
-    owner = repo_owner or os.environ.get("GITHUB_OWNER", "")
-    repo  = repo_name  or os.environ.get("GITHUB_REPO",  "")
-
-    missing = []
-    if not token:    missing.append("GITHUB_TOKEN")
-    if not owner:    missing.append("GITHUB_OWNER")
-    if not repo:     missing.append("GITHUB_REPO")
-    if not changes:  missing.append("(no changes to commit)")
-
-    if missing:
-        local = save_changes_locally(changes) if changes else {}
-        fix_cmd = "\n".join(f"  export {v}=your_{v.lower()}_here" for v in missing if v != "(no changes to commit)")
-        return {
-            "status":       "skipped",
-            "pr_url":       None,
-            "reason":       f"Missing credentials: {', '.join(missing)}",
-            "fix":          f"Set these environment variables before running:\n{fix_cmd}",
-            "local_save":   local
-        }
-
-    # Extract sandboxed path context passed from stage1 definitions
-    local_repo_path = "/tmp"
-    if isinstance(changes, list) and len(changes) > 0:
-        # Check if the first entry contains a repo pointer from main.py orchestration setup
-        local_repo_path = changes[0].get("repo_path", "/tmp")
+    raw_owner = repo_owner or os.environ.get("GITHUB_OWNER", "labgtm-ai")
+    raw_repo  = repo_name  or os.environ.get("GITHUB_REPO",  "java-legacy-enterprise-app")
     
-    # Fallback lookup engine mapping for common temporary folder bounds
-    if local_repo_path == "/tmp" or not local_repo_path:
-        paths = sorted(list(Path("/tmp").glob("srao_repo_*")), key=os.path.getmtime)
-        if paths:
-            local_repo_path = str(paths[-1])
+    if not token or not raw_owner or not raw_repo or not changes: 
+        logger.warning("⚠️ Missing critical parameters. Falling back to localized filesystem export.")
+        return save_changes_locally(changes)
+    
+    # ── FIX 3: Robust slug parsing that preserves organization hyphens cleanly ──
+    def clean_slug(s: str) -> str:
+        s = s.replace("https://", "").replace("http://", "").replace("github.com/", "")
+        s = s.strip("/").replace(".git", "")
+        return s
 
-    if not os.path.exists(local_repo_path):
-        return {"status": "error", "message": f"Could not find local repository sandbox directory path: {local_repo_path}"}
-
-    # Generate a unique dynamic branch name with timestamps to avoid git tracking overwrite conflicts
-    timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    feature_branch = f"srao/modernized_code_{timestamp_str}"
-
+    owner = clean_slug(raw_owner)
+    repo  = clean_slug(raw_repo)
+    
+    # ── REPOSITORY PATH DISCOVERY ──
+    paths = sorted(list(Path("/tmp").glob("srao_repo_*")), key=os.path.getmtime)
+    if not paths:
+        return {"status": "error", "message": "No valid git repository path found in /tmp"}
+    local_repo_path = str(paths[-1])
+    
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    feature_branch = f"srao/modernized_code_{ts}"
+    
+    # Dynamically extract the selected Java specification version from the data cache mapping
+    target_version = "21"
+    if changes and len(changes) > 0:
+        target_version = str(changes[0].get("target_version", "21"))
+    
     try:
-        logger.info("Executing local git workspace commits inside sandbox: %s", local_repo_path)
+        logger.info(f"Purging remote cache configurations in sandbox path: {local_repo_path}")
         
-        # 1. Setup local workspace git author profiles to prevent commit blocks
-        _run_git(local_repo_path, ["config", "user.name", "SRAO Modernization Agent"])
-        _run_git(local_repo_path, ["config", "user.email", "srao-agent@://google.com"])
+        # Configure local git actor identity
+        subprocess.run(["git", "config", "user.name", "SRAO Agent"], cwd=local_repo_path, check=True)
+        subprocess.run(["git", "config", "user.email", "srao@google.com"], cwd=local_repo_path, check=True)
         
-        # 2. Inject GitHub Authentication Token directly into git origin remote URI context
-        remote_url = f"https://x-access-token:{token}@://github.com/{owner}/{repo}.git"
-        _run_git(local_repo_path, ["remote", "set-url", "origin", remote_url])
-
-        # 3. Spin up and checkout the dynamically named branch
-        _run_git(local_repo_path, ["checkout", "-b", feature_branch])
-
-        # 4. Stage and commit changes inside the sandbox repo
-        _run_git(local_repo_path, ["add", "."])
-        _run_git(local_repo_path, ["commit", "-m", f"chore: automated java modernization refactor updates - {timestamp_str}"])
-
-        # 5. Push the feature branch upstream to your remote GitHub repository
-        logger.info("Pushing dynamic modernized branch '%s' upstream to GitHub...", feature_branch)
-        _run_git(local_repo_path, ["push", "origin", feature_branch])
-
-    except Exception as git_err:
-        logger.error("Local Git commit or push actions failed: %s", git_err)
-        return {"status": "error", "message": f"Git tracking push loop failed: {str(git_err)}"}
-
-    # ── 6. Trigger live GitHub Pull Request REST API Creation Call ─────────────
-    logger.info("Creating live GitHub Pull Request matching branch '%s' to target base '%s'...", feature_branch, base_branch)
+        # ── FIX 1: ALIGN DICTIONARY KEY MATCHING RULES ──
+        # Looks for 'modernised_code' to capture the refactored text assets cleanly
+        for change in changes:
+            file_path = change.get("file_path")
+            new_content = change.get("modernised_code") or change.get("content")
+            if file_path and new_content:
+                full_path = Path(local_repo_path) / file_path
+                full_path.parent.mkdir(parents=True, exist_ok=True)
+                full_path.write_text(new_content, encoding="utf-8")
+        
+        # ── REMOTE MANAGEMENT ──
+        subprocess.run(["git", "remote", "remove", "origin"], cwd=local_repo_path, capture_output=True)
+        
+        authenticated_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+        logger.info(f"Registering upstream remote origin path track: https://github.com/{owner}/{repo}.git")
+        subprocess.run(["git", "remote", "add", "origin", authenticated_url], cwd=local_repo_path, check=True)
+        
+        # Checkout branch, stage files, and commit
+        subprocess.run(["git", "checkout", "-b", feature_branch], cwd=local_repo_path, check=True)
+        subprocess.run(["git", "add", "."], cwd=local_repo_path, check=True)
+        subprocess.run(["git", "commit", "-m", f"refactor: modernized java assets to Java {target_version} compatibility via srao pipeline"], cwd=local_repo_path, check=True)
+        
+        logger.info(f"Pushing time-scoped feature branch '{feature_branch}' upstream...")
+        subprocess.run(["git", "push", "-u", "origin", feature_branch], cwd=local_repo_path, check=True)
+        
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Git execution failed: {e.stderr if hasattr(e, 'stderr') else str(e)}")
+        return {"status": "error", "message": f"Git sub-process failure: {str(e)}"}
+    except Exception as e: 
+        logger.error(f"Git operation block failed: {str(e)}")
+        return {"status": "error", "message": f"Git fail: {str(e)}"}
     
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json"
-    }
+    # ── PULL REQUEST CREATION (VERSION SYNCHRONIZED) ──
+    details = "\n".join([f"- **{c.get('file_path','unknown')}**: {c.get('explanation','Refactored legacy syntax structures.')}" for c in changes])
     
-    file_count = len(changes)
-    patterns_set = set()
-    for c in changes:
-        if "finding" in c and isinstance(c["finding"], dict):
-            patterns_set.add(c["finding"].get("pattern_id", "MODERNIZE"))
-        else:
-            patterns_set.add(c.get("pattern_id", "MODERNIZE"))
-            
-    patterns_str = ", ".join(patterns_set)
-
-    details_list = []
-    for c in changes:
-        f_name = c.get("file") or c.get("file_path") or "Unknown File"
-        exp = c.get("explanation") or c.get("result", {}).get("explanation", "Code refactoring applied.")
-        details_list.append(f"- **{f_name}**: {exp}")
-    details_str = "\n".join(details_list)
-
-    pr_payload = {
-        "title": PR_TITLE.format(n=file_count),
-        "body": PR_BODY.format(file_count=file_count, patterns=patterns_str, branch_name=feature_branch, details=details_str),
-        "head": feature_branch,
+    pr_body = (
+        f"## 🤖 AI-Powered Java Modernization (SRAO Agent)\n\n"
+        f"Generated automatically by the **SRAO Agent** on Google Cloud Vertex AI.\n\n"
+        f"### Summary\n\n"
+        f"| Analysis Metric Category | Evaluated Value Breakdown |\n"
+        f"|:---|:---|\n"
+        f"| **Files Modified & Upgraded** | {len(changes)} |\n"
+        f"| **Target Java Baseline Specification** | Java {target_version} |\n"
+        f"| **Dynamic Source Feature Branch** | `{feature_branch}` |\n\n"
+        f"### Changes Applied\n{details}\n\n"
+        f"*Model: Gemini 2.5 Flash · System Telemetry Blocks Approved.*"
+    )
+    
+    payload = {
+        "title": f"🛡️ Automated Modernization Upgrade (Java {target_version} Compliance)", 
+        "body": pr_body, 
+        "head": feature_branch, 
         "base": base_branch
     }
-
-    url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/pulls"
-    response = requests.post(url, json=pr_payload, headers=headers)
-
-    if response.status_code in (201, 200):
-        pr_data = response.json()
-        logger.info("🚀 SUCCESS! Live Pull Request registered at: %s", pr_data["html_url"])
-        return {
-            "status": "success",
-            "pr_url": pr_data["html_url"],
-            "message": f"Successfully created live automated PR at {pr_data['html_url']}",
-            "branch_name": feature_branch
-            }
-    else:
-        logger.error("GitHub API PR Creation failed: %s - %s", response.status_code, response.text)
-        return {"status": "error","message": f"GitHub API rejected PR generation request: {response.text}"}
+    
+    api_endpoint = f"{GITHUB_API_URL or 'https://api.github.com'}/repos/{owner}/{repo}/pulls"
+    logger.info(f"Dispatching post request downstream to GitHub API: {api_endpoint}")
+    
+    res = requests.post(
+        api_endpoint, 
+        json=payload, 
+        headers={
+            "Authorization": f"token {token}", 
+            "Accept": "application/vnd.github.v3+json"
+        }
+    )
+    
+    if res.status_code in (200, 201): 
+        pr_link = res.json()["html_url"]
+        logger.info(f"🚀 Pull Request created successfully: {pr_link}")
+        return {"status": "success", "pr_url": pr_link, "message": "PR created"}
+    
+    logger.error(f"❌ GitHub API Error: {res.status_code} - {res.text}")
+    return {"status": "error", "message": res.text}
         
 def _run_git(cwd: str, args: List[str]) -> str:
     """Executes safe local subprocess shell loops targeting specific sandbox paths."""
