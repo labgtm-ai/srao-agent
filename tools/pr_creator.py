@@ -22,7 +22,7 @@ load_dotenv()
 
 logger = logging.getLogger("srao.pr_creator")
 
-GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "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")
+GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_API_URL = "https://github.com"
 
 # SRAO FIX: Shifted target version from hardcoded strings to an evaluation template token slot
