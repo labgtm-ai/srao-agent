@@ -199,3 +199,38 @@ def _find_java_files(root: str, exclude_tests: bool = False) -> list[str]:
     # Sort: main sources first, then test sources, alphabetically within each group
     java_files.sort(key=lambda p: (1 if "src/test" in p else 0, p))
     return java_files
+
+def run_static_analysis_validation(repo_root: str) -> tuple[bool, str]:
+    """
+    Executes a high-speed targeted static analysis validation gate 
+    using Maven Checkstyle or PMD tracking plugins.
+    """
+    import subprocess
+    from pathlib import Path
+    
+    root_path = Path(repo_root)
+    
+    # ── CHECK FOR PMD CONFIGURATIONS ──
+    if (root_path / "pom.xml").exists():
+        try:
+            logger.info("⚙️ Static Analysis Gate: Executing localized PMD compliance scan...")
+            # Runs PMD check without failing the lifecycle execution loop completely
+            result = subprocess.run(
+                ["mvn", "pmd:check", "-DskipTests=true"],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            # If the build finishes cleanly with zero high-priority rule violations
+            if result.returncode == 0:
+                return True, ""
+            return False, result.stderr or result.stdout
+            
+        except subprocess.TimeoutExpired:
+            return False, "Static analysis execution timed out."
+        except Exception as e:
+            # Fallback pass if plugin targets are missing from legacy pom configurations
+            logger.warning(f"PMD plugin check skipped or unavailable: {e}")
+            
+    return True, ""

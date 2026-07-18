@@ -11,6 +11,7 @@ import os
 import subprocess
 import tempfile
 import difflib
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -21,7 +22,7 @@ load_dotenv()
 
 logger = logging.getLogger("srao.pr_creator")
 
-GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "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")
 GITHUB_API_URL = "https://github.com"
 
 # SRAO FIX: Shifted target version from hardcoded strings to an evaluation template token slot
@@ -129,13 +130,12 @@ def save_changes_locally(changes: List[Dict[str, Any]], output_dir: str = "/tmp/
         "files_written": written
     }
 
-
 def create_pull_request(repo_owner: str, repo_name: str, base_branch: str, changes: List[Dict]) -> dict:
     """
     Executes actual Git operations, applies file updates to disk,
     pushes a time-scoped feature branch upstream, and creates a GitHub Pull Request.
     """
-    global GITHUB_API_URL  # ── FIX 2: Explicitly bind the global API endpoint token URL
+    global GITHUB_API_URL
     
     token = os.environ.get("GITHUB_TOKEN", GITHUB_TOKEN)
     raw_owner = repo_owner or os.environ.get("GITHUB_OWNER", "labgtm-ai")
@@ -145,14 +145,24 @@ def create_pull_request(repo_owner: str, repo_name: str, base_branch: str, chang
         logger.warning("⚠️ Missing critical parameters. Falling back to localized filesystem export.")
         return save_changes_locally(changes)
     
-    # ── FIX 3: Robust slug parsing that preserves organization hyphens cleanly ──
-    def clean_slug(s: str) -> str:
-        s = s.replace("https://", "").replace("http://", "").replace("github.com/", "")
-        s = s.strip("/").replace(".git", "")
+    # ── Clean string extractor that strips out all URL elements ──
+    def sanitize_to_string(input_str: str) -> str:
+        s = str(input_str).replace("https://", "").replace("http://", "").replace("www.", "")
+        s = s.replace("://github.com", "").replace(".git", "").strip("/")
         return s
 
-    owner = clean_slug(raw_owner)
-    repo  = clean_slug(raw_repo)
+    # Convert inputs to clean, plain strings
+    clean_owner_path = sanitize_to_string(raw_owner)
+    clean_repo_path = sanitize_to_string(raw_repo)
+
+    # SAFE FIX: Explicit string indices parsing (No array lists)
+    if "/" in clean_owner_path:
+        parts = clean_owner_path.split("/")
+        owner = str(parts[0])
+        repo = str(parts[1]) if len(parts) > 1 else clean_repo_path.split("/")[-1]
+    else:
+        owner = clean_owner_path.split("/")[-1]
+        repo = clean_repo_path.split("/")[-1]
     
     # ── REPOSITORY PATH DISCOVERY ──
     paths = sorted(list(Path("/tmp").glob("srao_repo_*")), key=os.path.getmtime)
@@ -163,7 +173,6 @@ def create_pull_request(repo_owner: str, repo_name: str, base_branch: str, chang
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     feature_branch = f"srao/modernized_code_{ts}"
     
-    # Dynamically extract the selected Java specification version from the data cache mapping
     target_version = "21"
     if changes and len(changes) > 0:
         target_version = str(changes[0].get("target_version", "21"))
@@ -171,12 +180,9 @@ def create_pull_request(repo_owner: str, repo_name: str, base_branch: str, chang
     try:
         logger.info(f"Purging remote cache configurations in sandbox path: {local_repo_path}")
         
-        # Configure local git actor identity
         subprocess.run(["git", "config", "user.name", "SRAO Agent"], cwd=local_repo_path, check=True)
         subprocess.run(["git", "config", "user.email", "srao@google.com"], cwd=local_repo_path, check=True)
         
-        # ── FIX 1: ALIGN DICTIONARY KEY MATCHING RULES ──
-        # Looks for 'modernised_code' to capture the refactored text assets cleanly
         for change in changes:
             file_path = change.get("file_path")
             new_content = change.get("modernised_code") or change.get("content")
@@ -185,14 +191,13 @@ def create_pull_request(repo_owner: str, repo_name: str, base_branch: str, chang
                 full_path.parent.mkdir(parents=True, exist_ok=True)
                 full_path.write_text(new_content, encoding="utf-8")
         
-        # ── REMOTE MANAGEMENT ──
+        # ── REMOTE RE-CONFIG WITH SECURE URL ──
         subprocess.run(["git", "remote", "remove", "origin"], cwd=local_repo_path, capture_output=True)
         
-        authenticated_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
-        logger.info(f"Registering upstream remote origin path track: https://github.com/{owner}/{repo}.git")
+        authenticated_url = f"https://x-access-token:{token}@://github.com/{owner}/{repo}.git"
+        logger.info(f"Registering upstream remote origin path track: https://://github.com/{owner}/{repo}.git")
         subprocess.run(["git", "remote", "add", "origin", authenticated_url], cwd=local_repo_path, check=True)
         
-        # Checkout branch, stage files, and commit
         subprocess.run(["git", "checkout", "-b", feature_branch], cwd=local_repo_path, check=True)
         subprocess.run(["git", "add", "."], cwd=local_repo_path, check=True)
         subprocess.run(["git", "commit", "-m", f"refactor: modernized java assets to Java {target_version} compatibility via srao pipeline"], cwd=local_repo_path, check=True)
@@ -201,13 +206,29 @@ def create_pull_request(repo_owner: str, repo_name: str, base_branch: str, chang
         subprocess.run(["git", "push", "-u", "origin", feature_branch], cwd=local_repo_path, check=True)
         
     except subprocess.CalledProcessError as e:
-        logger.error(f"Git execution failed: {e.stderr if hasattr(e, 'stderr') else str(e)}")
-        return {"status": "error", "message": f"Git sub-process failure: {str(e)}"}
+        error_msg = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else str(e)
+        logger.error(f"Git execution failed: {error_msg}")
+        return {"status": "error", "message": f"Git sub-process failure: {error_msg}"}
     except Exception as e: 
         logger.error(f"Git operation block failed: {str(e)}")
         return {"status": "error", "message": f"Git fail: {str(e)}"}
     
-    # ── PULL REQUEST CREATION (VERSION SYNCHRONIZED) ──
+    # ── SAFE BASE BRANCH RESOLUTION ──
+    resolved_base = base_branch
+    if not resolved_base or "/" in str(resolved_base):
+        try:
+            res_br = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "origin/HEAD"], 
+                cwd=local_repo_path, capture_output=True, text=True
+            )
+            if res_br.returncode == 0:
+                resolved_base = res_br.stdout.strip().replace("origin/", "")
+            else:
+                resolved_base = "main"
+        except Exception:
+            resolved_base = "main"
+
+    # ── PULL REQUEST CREATION ──
     details = "\n".join([f"- **{c.get('file_path','unknown')}**: {c.get('explanation','Refactored legacy syntax structures.')}" for c in changes])
     
     pr_body = (
@@ -227,11 +248,16 @@ def create_pull_request(repo_owner: str, repo_name: str, base_branch: str, chang
         "title": f"🛡️ Automated Modernization Upgrade (Java {target_version} Compliance)", 
         "body": pr_body, 
         "head": feature_branch, 
-        "base": base_branch
+        "base": resolved_base
     }
     
-    api_endpoint = f"{GITHUB_API_URL or 'https://api.github.com'}/repos/{owner}/{repo}/pulls"
-    logger.info(f"Dispatching post request downstream to GitHub API: {api_endpoint}")
+    # SAFE FIX: Force public API routing for github.com deployments
+    base_api = GITHUB_API_URL or 'https://github.com'
+    if "api.github.com" not in base_api and "github.com" in base_api:
+        base_api = "https://github.com"
+
+    api_endpoint = f"{base_api.rstrip('/')}/repos/{owner}/{repo}/pulls"
+    logger.info(f"Dispatching post request downstream to GitHub API: {api_endpoint} targeting base branch: '{resolved_base}'")
     
     res = requests.post(
         api_endpoint, 
@@ -249,6 +275,9 @@ def create_pull_request(repo_owner: str, repo_name: str, base_branch: str, chang
     
     logger.error(f"❌ GitHub API Error: {res.status_code} - {res.text}")
     return {"status": "error", "message": res.text}
+
+
+
         
 def _run_git(cwd: str, args: List[str]) -> str:
     """Executes safe local subprocess shell loops targeting specific sandbox paths."""
