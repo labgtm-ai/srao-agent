@@ -36,7 +36,7 @@ LOCATION   = os.environ.get("GCP_LOCATION",   "us-central1")
 MODEL_NAME = "gemini-2.5-flash"
 MAX_RETRIES = 3
 BATCH_SIZE = int(os.environ.get("SRAO_BATCH_SIZE", "1"))
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "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")
 GITHUB_API_URL = "https://api.github.com"
 APP_NAME, USER_ID, SESSION_ID = "srao-app", "developer", "srao-session-001"
 
@@ -360,17 +360,22 @@ def stage1_scan_and_analyse(repo_url: str, branch: str, target_version: int) -> 
     findings_by_file = {}
     
     for f in all_findings: 
-        findings_by_file.setdefault(f.get("file","unknown"), []).append({
-            "pattern_id": f.get("pattern_id"), 
-            "severity": f.get("severity"), 
-            "description": f.get("description"), 
-            "target_java": f.get("target_java")
+        findings_by_file.setdefault(
+            f.get("file", "unknown"),
+            []
+            ).append({
+            "pattern_id": f.get("pattern_id"),
+            "severity": f.get("severity"),
+            "description": f.get("description"),
+            "target_java": f.get("target_java"),
+            "line_numbers": f.get("line_numbers", [])
         })
         
     return {
         "repo_path": repo_path, 
         "findings_by_file": findings_by_file, 
-        "ordered_files": classified.get("recommended_order", [])
+        "ordered_files": classified.get("recommended_order", []),
+        "target_version": target_version
     }
 
 
@@ -389,6 +394,12 @@ def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
     ordered_files = stage1_data.get("ordered_files", [])
     findings_by_file = stage1_data.get("findings_by_file", {})
     repo_root = stage1_data["repo_path"]
+
+    requested_target_version = int(
+        stage1_data.get("target_version", 21)
+        )
+
+    target_java = f"Java {requested_target_version}"
     
     if not ordered_files:
         logger.info("No legacy code pattern matches found. Skipping Stage 2 modernization execution.")
@@ -416,7 +427,6 @@ def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
         for p_idx, finding in enumerate(file_findings):
             pattern_id = finding.get("pattern_id", "MODERNIZE")
             description = finding.get("description", "Refactor legacy architecture.")
-            target_java = finding.get("target_java", "Java 17/21")
             
             logger.info(f"   ↳ [Pattern {p_idx+1}/{len(file_findings)}] Executing direct modernization for: {pattern_id}")
             
@@ -460,13 +470,34 @@ def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
             
             if file_originally_changed and final_file_content != baseline_code_content:
                 logger.info(f"✅ Target module modernization SUCCESSFUL: {target_file} saved to cache.")
+                pattern_ids = [
+                    finding.get("pattern_id", "UNKNOWN") 
+                    for finding in file_findings
+                    ]
+
+                severity_summary = {
+                    "HIGH": 0,
+                    "MEDIUM": 0,
+                    "LOW": 0
+                }
+
+                for finding in file_findings:
+                    severity = finding.get("severity", "LOW")
+                    severity_summary[severity] = severity_summary.get(severity, 0) + 1
+
                 ACCUMULATED_CHANGES_CACHE.append({
                     "file_path": target_file,
                     "file": target_file,
                     "modernised_code": final_file_content,
                     "repo_path": repo_root,
-                    "target_version": target_java_version, 
-                    "explanation": "Refactored legacy Java pattern implementation structures dynamically."
+                    "target_version": requested_target_version,
+                    "pattern_ids": pattern_ids,
+                    "severity_summary": severity_summary,
+                    "findings": file_findings,
+                    "explanation": (
+                        f"Modernized {len(pattern_ids)} legacy pattern(s): "
+                        f"{', '.join(pattern_ids)}."
+                    )
                 })
             else:
                 logger.info(f"➖ Workspace Unchanged for: {target_file} (No compilation edits were retained.)")
@@ -502,7 +533,7 @@ if __name__ == "__main__":
     import sys
 
     # --- Keep Existing Environment Configurations Intact ---
-    os.environ["GITHUB_TOKEN"] = ""
+    os.environ["GITHUB_TOKEN"] = "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"
     os.environ["GITHUB_OWNER"] = "labgtm-ai"
     os.environ["GITHUB_REPO"]  = "java-legacy-enterprise-app"
     

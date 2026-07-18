@@ -121,6 +121,122 @@ PATTERNS = [
         "Java 15+",
         15, 
     ),
+    (
+        "ANONYMOUS_INNER_CLASS",
+        "Anonymous inner class detected — replace with Lambda expression",
+        "MEDIUM",
+        r"new\s+\w+\s*\(\s*\)\s*\{",
+        "Java 8+",
+        8,
+    ),
+
+    (
+        "HASHTABLE",
+        "Legacy Hashtable usage — replace with HashMap or ConcurrentHashMap",
+        "MEDIUM",
+        r"\bHashtable\b",
+        "Java 8+",
+        8,
+    ),
+
+    (
+        "VECTOR",
+        "Legacy Vector usage — replace with ArrayList or immutable collections",
+        "MEDIUM",
+        r"\bVector\b",
+        "Java 8+",
+        8,
+    ),
+
+    (
+        "ENUMERATION",
+        "Legacy Enumeration usage — replace with Iterator or Streams",
+        "LOW",
+        r"\bEnumeration\b",
+        "Java 8+",
+        8,
+    ),
+
+    (
+        "DATE_API",
+        "Legacy Date API usage — replace with java.time API",
+        "MEDIUM",
+        r"\bDate\b",
+        "Java 8+",
+        8,
+    ),
+
+    (
+        "CALENDAR_API",
+        "Legacy Calendar API usage — replace with java.time API",
+        "MEDIUM",
+        r"\bCalendar\b",
+        "Java 8+",
+        8,
+    ),
+
+    (
+        "SIMPLE_DATE_FORMAT",
+        "SimpleDateFormat usage — replace with DateTimeFormatter",
+        "LOW",
+        r"\bSimpleDateFormat\b",
+        "Java 8+",
+        8,
+    ),
+
+    (
+        "CALLBACK_INTERFACE",
+        "Callback interface usage — replace with CompletableFuture",
+        "MEDIUM",
+        r"interface\s+\w*Callback|implements\s+\w*Callback|new\s+\w*Callback\s*\(",
+        "Java 8+",
+        8,
+    ),
+
+    (
+        "UNCHECKED_CAST",
+        "Unchecked type casting detected",
+        "HIGH",
+        r"\(\s*[\w<>?,\s]+\s*\)\s*\w+",
+        "Java 8+",
+        8,
+    ),
+
+    (
+        "SWITCH_STATEMENT",
+        "Traditional switch statement — replace with switch expressions",
+        "LOW",
+        r"\bswitch\s*\(",
+        "Java 14+",
+        14,
+    ),
+
+    (
+        "FIELD_INJECTION",
+        "Spring field injection detected — replace with constructor injection",
+        "MEDIUM",
+        r"@Autowired\s*\n\s*private",
+        "Java 8+",
+        8,
+    ),
+
+    (
+        "GENERIC_EXCEPTION",
+        "Generic Exception catch detected — use specific exception types",
+        "LOW",
+        r"catch\s*\(\s*Exception\s+\w+\s*\)",
+        "Java 8+",
+        8,
+    ),
+
+    (
+        "SYSTEM_OUT",
+        "System.out.println detected — replace with logging framework",
+        "LOW",
+        r"System\.out\.println\s*\(",
+        "Java 8+",
+        8,
+    ),
 ]
 
 SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
