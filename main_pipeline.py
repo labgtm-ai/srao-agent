@@ -36,7 +36,7 @@ LOCATION   = os.environ.get("GCP_LOCATION",   "us-central1")
 MODEL_NAME = "gemini-2.5-flash"
 MAX_RETRIES = 3
 BATCH_SIZE = int(os.environ.get("SRAO_BATCH_SIZE", "1"))
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "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")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_API_URL = "https://api.github.com"
 APP_NAME, USER_ID, SESSION_ID = "srao-app", "developer", "srao-session-001"
 
@@ -502,7 +502,7 @@ if __name__ == "__main__":
     import sys
 
     # --- Keep Existing Environment Configurations Intact ---
-    os.environ["GITHUB_TOKEN"] = "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"
+    os.environ["GITHUB_TOKEN"] = ""
     os.environ["GITHUB_OWNER"] = "labgtm-ai"
     os.environ["GITHUB_REPO"]  = "java-legacy-enterprise-app"
     
