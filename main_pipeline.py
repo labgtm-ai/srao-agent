@@ -74,6 +74,65 @@ FALLBACK_KB = {
     "SYNCHRONIZED_BLOCK": "private final AtomicInteger count = new AtomicInteger(0); public void increment() { count.incrementAndGet(); }"
 }
 
+def print_execution_summary(
+    repo_name: str,
+    target_version: int,
+    files_modernized: int,
+    findings_before: int,
+    pr_result: dict,
+    validation_results: dict,
+):
+    """
+    Prints a concise execution summary at the end of the pipeline.
+    """
+
+    line = "=" * 90
+
+    def status(value):
+        if value is True:
+            return "✅"
+        if value is False:
+            return "❌"
+        return "➖"
+
+    logger.info("")
+    logger.info(line)
+    logger.info("🎉 SRAO MODERNIZATION PIPELINE COMPLETED")
+    logger.info(line)
+
+    logger.info("Repository            : %s", repo_name)
+    logger.info("Target Java Version   : Java %s", target_version)
+    logger.info("Files Modernized      : %s", files_modernized)
+    logger.info("Patterns Detected     : %s", findings_before)
+
+    logger.info("")
+    logger.info("Validation Summary")
+    logger.info("------------------------------")
+    logger.info("%s Baseline Compile", status(validation_results.get("baseline_compile")))
+    logger.info("%s Production Compile", status(validation_results.get("production_compile")))
+    logger.info("%s Test Compile", status(validation_results.get("test_compile")))
+    logger.info("%s Global Maven Build", status(validation_results.get("global_build")))
+    logger.info("%s Spring Boot Startup", status(validation_results.get("spring_boot")))
+    logger.info(
+        "%s Static Analysis (%s)",
+        status(validation_results.get("static_analysis")),
+        validation_results.get("static_analysis_tool", "N/A"),
+    )
+
+    logger.info("")
+    logger.info("GitHub")
+    logger.info("------------------------------")
+    logger.info("%s Feature Branch", status(pr_result.get("status") == "success"))
+    logger.info("%s Pull Request", status(pr_result.get("status") == "success"))
+
+    if pr_result.get("pr_url"):
+        logger.info("")
+        logger.info("Pull Request URL")
+        logger.info("------------------------------")
+        logger.info(pr_result["pr_url"])
+
+    logger.info(line)
+
 def scan_repository(repo_url: str, branch: str = "main", target_dir: Optional[str] = None) -> dict:
     if os.path.exists(repo_url) and os.path.isdir(repo_url):
         return {"status": "success", "repo_path": str(Path(repo_url).resolve()), "java_files": _find_java_files(repo_url)}
@@ -490,6 +549,8 @@ def stage2_process_batches(
         )
         return
     
+    validation_results["baseline_compile"] = True
+    
     retriever = RagRetriever()
 
     # ================================================================
@@ -608,6 +669,7 @@ def stage2_process_batches(
                     "     ✅ Pattern %s applied and main source compiled.",
                     pattern_id
                 )
+                production_change_compiled = True
 
                 file_originally_changed = True
                 successfully_applied_findings.append(finding)
@@ -684,6 +746,7 @@ def stage2_process_batches(
                     target_file
                 )
 
+    validation_results["production_compile"] = production_change_compiled
     # ================================================================
     # STEP 4: Compile tests against modernized production classes
     # ================================================================
@@ -933,6 +996,8 @@ def stage2_process_batches(
         logger.info(
             "✅ Existing tests compile against the modernized production API."
         )
+    
+    validation_results["test_compile"] = True
 
     # ================================================================
     # STEP 5: Comprehensive project validation gates
@@ -960,7 +1025,9 @@ def stage2_process_batches(
             build_log[-8000:]
         )
         return
-        
+
+    validation_results["global_build"] = True
+
     boot_ok, boot_log = run_springboot_boot_check(repo_root)
 
     if not boot_ok:
@@ -971,6 +1038,7 @@ def stage2_process_batches(
         )
         return
 
+    validation_results["spring_boot"] = True
     # ================================================================
     # STATIC ANALYSIS VALIDATION GATE
     # ================================================================
@@ -997,6 +1065,12 @@ def stage2_process_batches(
             "✅ Static analysis passed using %s.",
             static_tool
         )
+    validation_results["static_analysis_tool"] = static_tool
+
+    if static_tool == "SKIPPED":
+        validation_results["static_analysis"] = None
+    else:
+        validation_results["static_analysis"] = True
 
     logger.info(
         "🎉 All validation gates passed. "
@@ -1019,11 +1093,25 @@ def stage2_process_batches(
         changes=ACCUMULATED_CHANGES_CACHE
     )
 
+    validation_results["pr_created"] = (
+        pr_result.get("status") == "success"
+    )
+
     if pr_result.get("status") == "success":
         logger.info(
             "✨ Modernization workflow successful. "
             "Pull Request: %s",
             pr_result.get("pr_url")
+        )
+        print_execution_summary(
+            repo_name=os.environ.get("GITHUB_REPO", "Repository"),
+            target_version=requested_target_version,
+            files_modernized=len(ACCUMULATED_CHANGES_CACHE),
+            findings_before=sum(
+                len(v) for v in findings_by_file.values()
+            ),
+            pr_result=pr_result,
+            validation_results=validation_results,
         )
     else:
         logger.error(
@@ -1038,7 +1126,7 @@ if __name__ == "__main__":
     # --- Keep Existing Environment Configurations Intact ---
     os.environ["GITHUB_TOKEN"] = ""
     os.environ["GITHUB_OWNER"] = "labgtm-ai"
-    os.environ["GITHUB_REPO"]  = "java-legacy-enterprise-app"
+    # os.environ["GITHUB_REPO"]  = "java-legacy-enterprise-app"
     
     os.environ["GCP_PROJECT_ID"] = "deutschebank-aipocs"
     os.environ["GOOGLE_CLOUD_PROJECT"] = "deutschebank-aipocs"
