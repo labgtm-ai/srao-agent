@@ -11,6 +11,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
+import time
 
 # Force Google GenAI SDK to use Vertex AI endpoints
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"]   = "true"
@@ -78,7 +79,7 @@ def scan_repository(repo_url: str, branch: str = "main", target_dir: Optional[st
         return {"status": "success", "repo_path": str(Path(repo_url).resolve()), "java_files": _find_java_files(repo_url)}
     clone_dir = target_dir or tempfile.mkdtemp(prefix="srao_repo_")
     try:
-        res = subprocess.run(["git", "clone", "--depth", "1", "--branch", branch, repo_url, clone_dir], capture_output=True, text=True, timeout=120)
+        res = subprocess.run(["git", "clone", "--branch", branch, repo_url, clone_dir], capture_output=True, text=True, timeout=120)
         if res.returncode != 0: return {"status": "error", "message": f"git clone failed: {res.stderr.strip()}"}
         return {"status": "success", "repo_path": clone_dir, "java_files": _find_java_files(clone_dir)}
     except Exception as e: return {"status": "error", "message": str(e)}
@@ -149,7 +150,14 @@ def run_global_project_build(repo_root: str) -> tuple[bool, str]:
             return True, "SUCCESS"
         
         logger.error("❌ Global Maven Build Failed.")
-        return False, res.stderr or res.stdout
+        build_output = (
+            (res.stdout or "")
+            + "\n"
+            + (res.stderr or "")
+        )
+
+        return False, build_output
+        #return False, res.stderr or res.stdout
     except Exception as e:
         return False, f"Maven global execution crash: {str(e)}"
 
@@ -379,17 +387,31 @@ def stage1_scan_and_analyse(repo_url: str, branch: str, target_version: int) -> 
     }
 
 
-def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
+def stage2_process_batches(
+    stage1_data: dict,
+    runner: InMemoryRunner
+):
     """
-    Sequentially loops through workspace files one-by-one, bypassing multi-agent 
-    tool session loops to call the modernization engine directly as a deterministic service.
+    Modernizes production Java files sequentially.
+
+    Production source changes are validated using Maven main-source
+    compilation. After all production files are complete, affected test
+    classes are updated separately to match the modernized production API.
     """
+
     from tools.code_modernizer import modernize_code_snippet
     from tools.rag_retriever import RagRetriever
-    # Look for your existing repo_scanner import line and make sure it brings in run_compile_validation
-    from tools.repo_scanner import run_compile_validation, clean_backup_files, revert_file_changes
+    from tools.repo_scanner import (
+        run_compile_validation,
+        run_test_compile_validation,
+        extract_failing_test_files,
+        run_target_baseline_compile,
+        prepare_maven_target_version,
+        run_static_analysis_validation,
+        clean_backup_files,
+        revert_file_changes
+    )
     from tools.pr_creator import create_pull_request
-
 
     ordered_files = stage1_data.get("ordered_files", [])
     findings_by_file = stage1_data.get("findings_by_file", {})
@@ -397,47 +419,153 @@ def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
 
     requested_target_version = int(
         stage1_data.get("target_version", 21)
-        )
-
+    )
     target_java = f"Java {requested_target_version}"
-    
+
+    pipeline_start_time = time.time()
+
+    validation_results = {
+        "baseline_compile": False,
+        "production_compile": False,
+        "test_compile": False,
+        "global_build": False,
+        "spring_boot": False,
+        "static_analysis": False,
+        "static_analysis_tool": "NOT_RUN",
+        "pr_created": False
+    }
+
     if not ordered_files:
-        logger.info("No legacy code pattern matches found. Skipping Stage 2 modernization execution.")
+        logger.info(
+            "No legacy code pattern matches found. "
+            "Skipping Stage 2 modernization execution."
+        )
         return
 
     total_files = len(ordered_files)
-    logger.info("=== STAGE 2: Modernizing codebases sequentially (Direct Service Architecture) ===")
+
+    logger.info(
+        "=== STAGE 2: Modernizing code sequentially "
+        "(Direct Service Architecture) ==="
+    )
 
     global ACCUMULATED_CHANGES_CACHE
     ACCUMULATED_CHANGES_CACHE = []
-    retriever = RagRetriever()
+
+    # ================================================================
+    # STEP 1: Update Maven configuration once for the selected target
+    # ================================================================
+
+    pom_ok, pom_message, pom_change = prepare_maven_target_version(
+        repo_root=repo_root,
+        target_version=requested_target_version
+    )
+
+    if not pom_ok:
+        logger.error(
+            "Unable to prepare Maven project: %s",
+            pom_message
+        )
+        return
+
+    logger.info(pom_message)
+
+    if pom_change:
+        pom_change["repo_path"] = repo_root
+        ACCUMULATED_CHANGES_CACHE.append(pom_change)
+
+    # ================================================================
+    # STEP 2: Validate baseline project before source modernization
+    # ================================================================
+
+    baseline_ok, baseline_log = run_target_baseline_compile(
+        repo_root=repo_root
+    )
+
+    if not baseline_ok:
+        logger.error(
+            "Baseline project compilation failed after updating "
+            "the Maven target version.\n%s",
+            baseline_log[-6000:]
+        )
+        return
     
+    retriever = RagRetriever()
+
+    # ================================================================
+    # STEP 3: Modernize production source files
+    # ================================================================
+
     for i, target_file in enumerate(ordered_files):
+
+        # Test classes are handled later in a dedicated compatibility pass.
+        normalized_target_file = target_file.replace("\\", "/")
+
+        if normalized_target_file.startswith("src/test/"):
+            logger.info(
+                "Skipping test source during production modernization: %s",
+                target_file
+            )
+            continue
+
         file_findings = findings_by_file.get(target_file, [])
+
         if not file_findings:
             continue
-            
-        logger.info(f"⏳ Processing target module [{i+1}/{total_files}]: {target_file} ({len(file_findings)} patterns found)")
-        
-        full_path = Path(repo_root) / target_file
-        baseline_code_content = full_path.read_text(encoding="utf-8") if full_path.exists() else ""
-        file_originally_changed = False
 
-        # Process each pattern sequentially as an isolated structural delta pass
+        logger.info(
+            "⏳ Processing target module [%d/%d]: %s "
+            "(%d patterns found)",
+            i + 1,
+            total_files,
+            target_file,
+            len(file_findings)
+        )
+
+        full_path = Path(repo_root) / target_file
+
+        baseline_code_content = (
+            full_path.read_text(encoding="utf-8")
+            if full_path.exists()
+            else ""
+        )
+
+        file_originally_changed = False
+        successfully_applied_findings = []
+
+        # Process each legacy pattern independently.
         for p_idx, finding in enumerate(file_findings):
-            pattern_id = finding.get("pattern_id", "MODERNIZE")
-            description = finding.get("description", "Refactor legacy architecture.")
-            
-            logger.info(f"   ↳ [Pattern {p_idx+1}/{len(file_findings)}] Executing direct modernization for: {pattern_id}")
-            
-            # Read current disk state (picks up edits from a previous pass)
-            original_code_content = full_path.read_text(encoding="utf-8") if full_path.exists() else ""
-            
-            # Fetch the precise migration recipe from your RAG knowledge base
-            rag_context = retriever.get_migration_recipe(pattern_id, original_code_content)
-            
-            # ── CRITICAL FIX: CALL THE MODERNIZATION ENGINE DIRECTLY AS A SERVICE ──
-            # This completely bypasses the ADK session layer, forcing the file to load, refactor, and write to disk
+
+            pattern_id = finding.get(
+                "pattern_id",
+                "MODERNIZE"
+            )
+
+            description = finding.get(
+                "description",
+                "Refactor legacy architecture."
+            )
+
+            logger.info(
+                "   ↳ [Pattern %d/%d] Executing modernization for: %s",
+                p_idx + 1,
+                len(file_findings),
+                pattern_id
+            )
+
+            # Read the latest file content because earlier pattern passes
+            # may already have updated this same class.
+            original_code_content = (
+                full_path.read_text(encoding="utf-8")
+                if full_path.exists()
+                else ""
+            )
+
+            rag_context = retriever.get_migration_recipe(
+                pattern_id,
+                original_code_content
+            )
+
             result = modernize_code_snippet(
                 file_path=str(full_path),
                 description=description,
@@ -446,34 +574,81 @@ def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
                 pattern_id=pattern_id,
                 rag_context=rag_context
             )
-            
-            if result.get("status") == "success":
-                current_code_content = full_path.read_text(encoding="utf-8")
-                
-                if current_code_content != original_code_content:
-                    # Run targeted compilation check instantly
-                    compiled_ok, compile_log = run_compile_validation(repo_root, target_file)
-                    
-                    if compiled_ok:
-                        logger.info(f"     ✅ Pattern {pattern_id} applied and compiled cleanly!")
-                        file_originally_changed = True
-                        clean_backup_files(repo_root, target_file)
-                    else:
-                        logger.warning(f"     ⚠️ Pattern {pattern_id} failed compilation. Rolling back this specific rule.")
-                        full_path.write_text(original_code_content, encoding="utf-8")
-            else:
-                logger.error(f"     ❌ Modernizer failed to process pattern {pattern_id}: {result.get('message')}")
 
-        # ── POST-FILE ANALYSIS TRACKING ──
+            if result.get("status") != "success":
+                logger.error(
+                    "     ❌ Modernizer failed for pattern %s: %s",
+                    pattern_id,
+                    result.get("message")
+                )
+                continue
+
+            current_code_content = (
+                full_path.read_text(encoding="utf-8")
+                if full_path.exists()
+                else ""
+            )
+
+            if current_code_content == original_code_content:
+                logger.info(
+                    "     ➖ Pattern %s produced no source change.",
+                    pattern_id
+                )
+                continue
+
+            # Compile only production source here.
+            # Test compatibility is handled after all production classes.
+            compiled_ok, compile_log = run_compile_validation(
+                repo_root=repo_root,
+                relative_file_path=target_file
+            )
+
+            if compiled_ok:
+                logger.info(
+                    "     ✅ Pattern %s applied and main source compiled.",
+                    pattern_id
+                )
+
+                file_originally_changed = True
+                successfully_applied_findings.append(finding)
+                clean_backup_files(repo_root, target_file)
+
+            else:
+                logger.warning(
+                    "     ⚠️ Pattern %s failed production compilation "
+                    "for %s. Rolling back only this pattern change.\n%s",
+                    pattern_id,
+                    target_file,
+                    compile_log[-6000:]
+                )
+
+                full_path.write_text(
+                    original_code_content,
+                    encoding="utf-8"
+                )
+
+        # ------------------------------------------------------------
+        # Record the final validated state of this production file.
+        # ------------------------------------------------------------
+    
         if full_path.exists():
-            final_file_content = full_path.read_text(encoding="utf-8")
-            
-            if file_originally_changed and final_file_content != baseline_code_content:
-                logger.info(f"✅ Target module modernization SUCCESSFUL: {target_file} saved to cache.")
+            final_file_content = full_path.read_text(
+                encoding="utf-8"
+            )
+
+            if (
+                file_originally_changed
+                and final_file_content != baseline_code_content
+            ):
+                logger.info(
+                    "✅ Production module modernization successful: %s",
+                    target_file
+                )
+
                 pattern_ids = [
-                    finding.get("pattern_id", "UNKNOWN") 
-                    for finding in file_findings
-                    ]
+                    finding.get("pattern_id", "UNKNOWN")
+                    for finding in successfully_applied_findings
+                ]
 
                 severity_summary = {
                     "HIGH": 0,
@@ -481,9 +656,11 @@ def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
                     "LOW": 0
                 }
 
-                for finding in file_findings:
+                for finding in successfully_applied_findings:
                     severity = finding.get("severity", "LOW")
-                    severity_summary[severity] = severity_summary.get(severity, 0) + 1
+                    severity_summary[severity] = (
+                        severity_summary.get(severity, 0) + 1
+                    )
 
                 ACCUMULATED_CHANGES_CACHE.append({
                     "file_path": target_file,
@@ -493,40 +670,366 @@ def stage2_process_batches(stage1_data: dict, runner: InMemoryRunner):
                     "target_version": requested_target_version,
                     "pattern_ids": pattern_ids,
                     "severity_summary": severity_summary,
-                    "findings": file_findings,
+                    "findings": successfully_applied_findings,
                     "explanation": (
                         f"Modernized {len(pattern_ids)} legacy pattern(s): "
                         f"{', '.join(pattern_ids)}."
                     )
                 })
+
             else:
-                logger.info(f"➖ Workspace Unchanged for: {target_file} (No compilation edits were retained.)")
+                logger.info(
+                    "➖ Workspace unchanged for %s. "
+                    "No production edits were retained.",
+                    target_file
+                )
 
-    # ── COMPREHENSIVE PROJECT VALIDATION GATES ──
-    if ACCUMULATED_CHANGES_CACHE:
-        logger.info(f"Captured {len(ACCUMULATED_CHANGES_CACHE)} verified file additions. Advancing to Project Validation Suite...")
-        
-        build_ok, build_log = run_global_project_build(repo_root)
-        if not build_ok:
-            logger.error(f"🛑 CRITICAL BUILD BLOCKER: Global compilation failed.\n{build_log[:1200]}")
-            return
-            
-        boot_ok, boot_log = run_springboot_boot_check(repo_root)
-        if not boot_ok:
-            logger.error(f"🛑 CRITICAL RUNTIME BLOCKER: Application failed to boot cleanly.\n{boot_log}")
-            return
+    # ================================================================
+    # STEP 4: Compile tests against modernized production classes
+    # ================================================================
 
-        logger.info("🎉 All Validation Gates Passed! Pushing code updates upstream to GitHub...")
-        pr_result = create_pull_request(
-            repo_owner=os.environ.get("GITHUB_OWNER", ""), 
-            repo_name=os.environ.get("GITHUB_REPO", ""), 
-            base_branch="main", 
-            changes=ACCUMULATED_CHANGES_CACHE
+    logger.info(
+        "=== TEST COMPATIBILITY VALIDATION ==="
+    )
+
+    test_compile_ok, test_compile_log = (
+        run_test_compile_validation(repo_root)
+    )
+
+    if not test_compile_ok:
+        logger.warning(
+            "Test compilation failed after production modernization. "
+            "Attempting to update affected test classes."
         )
-        logger.info(f"✨ Modernization Workflow Successful! Destination URL: {pr_result.get('pr_url', pr_result.get('message'))}")
-    else:
-        logger.warning("No functional code adjustments cleared compilation checks. Skipping PR submission.")
 
+        failing_test_files = extract_failing_test_files(
+            repo_root=repo_root,
+            compile_log=test_compile_log
+        )
+
+        if not failing_test_files:
+            logger.error(
+                "Test compilation failed, but no failing test files "
+                "could be identified.\n%s",
+                test_compile_log[-8000:]
+            )
+            return
+
+        logger.info(
+            "Failing test files detected: %s",
+            ", ".join(failing_test_files)
+        )
+
+        # Build context only from production files that were actually
+        # changed. This avoids sending the entire repository to Gemini.
+        production_context_sections = []
+
+        for change in ACCUMULATED_CHANGES_CACHE:
+            production_file = str(
+                change.get("file_path", "")
+            ).replace("\\", "/")
+
+            if not production_file.startswith("src/main/java/"):
+                continue
+
+            production_code = change.get(
+                "modernised_code",
+                ""
+            )
+
+            if not production_code:
+                production_path = Path(repo_root) / production_file
+
+                if production_path.exists():
+                    production_code = production_path.read_text(
+                        encoding="utf-8",
+                        errors="replace"
+                    )
+
+            production_context_sections.append(
+                f"FILE: {production_file}\n"
+                f"```java\n"
+                f"{production_code}\n"
+                f"```"
+            )
+
+        production_context = "\n\n".join(
+            production_context_sections
+        )
+
+        # ------------------------------------------------------------
+        # Modernize each test class that failed compilation.
+        # ------------------------------------------------------------
+
+        for test_file in failing_test_files:
+
+            test_path = Path(repo_root) / test_file
+
+            if not test_path.exists():
+                logger.error(
+                    "Failing test file does not exist: %s",
+                    test_file
+                )
+                return
+
+            original_test_code = test_path.read_text(
+                encoding="utf-8",
+                errors="replace"
+            )
+
+            test_rag_context = (
+                "The production source code has already been modernized.\n"
+                "Update this test class to compile against the current "
+                "production API while preserving the original test intent, "
+                "assertions, and coverage.\n\n"
+                "Do not modify production source code.\n"
+                "Do not remove tests merely to make compilation pass.\n\n"
+                "MAVEN TEST-COMPILATION ERRORS:\n"
+                f"{test_compile_log[-8000:]}\n\n"
+                "CURRENT MODERNIZED PRODUCTION SOURCE:\n"
+                f"{production_context}"
+            )
+
+            logger.info(
+                "Updating test compatibility for: %s",
+                test_file
+            )
+
+            test_result = modernize_code_snippet(
+                file_path=str(test_path),
+                description=(
+                    "Update this test class to use the current modernized "
+                    "production API. Preserve its original assertions and "
+                    "behavior. Do not change production source code."
+                ),
+                target_java=target_java,
+                legacy_code=original_test_code,
+                pattern_id="TEST_COMPATIBILITY",
+                rag_context=test_rag_context
+            )
+
+            if test_result.get("status") != "success":
+                logger.error(
+                    "Unable to modernize test class %s: %s",
+                    test_file,
+                    test_result.get("message")
+                )
+                return
+
+            modernized_test_code = test_path.read_text(
+                encoding="utf-8",
+                errors="replace"
+            )
+
+            if modernized_test_code == original_test_code:
+                logger.error(
+                    "Test modernization produced no change for %s.",
+                    test_file
+                )
+                return
+
+            ACCUMULATED_CHANGES_CACHE.append({
+                "file_path": test_file,
+                "file": test_file,
+                "modernised_code": modernized_test_code,
+                "repo_path": repo_root,
+                "target_version": requested_target_version,
+                "pattern_ids": ["TEST_COMPATIBILITY"],
+                "severity_summary": {
+                    "HIGH": 1,
+                    "MEDIUM": 0,
+                    "LOW": 0
+                },
+                "findings": [{
+                    "pattern_id": "TEST_COMPATIBILITY",
+                    "severity": "HIGH",
+                    "description": (
+                        "Test source was incompatible with the "
+                        "modernized production API."
+                    ),
+                    "target_java": target_java,
+                    "line_numbers": []
+                }],
+                "explanation": (
+                    "Updated the test class to compile against the "
+                    "modernized production API while preserving test intent."
+                )
+            })
+
+        # Validate all updated test classes together.
+        test_compile_ok, test_compile_log = (
+            run_test_compile_validation(repo_root)
+        )
+
+        if not test_compile_ok:
+            logger.warning(
+                "Initial test modernization still has compilation errors. "
+                "Running one corrective test pass.\n%s",
+                test_compile_log[-6000:]
+            )
+
+            for test_file in failing_test_files:
+                test_path = Path(repo_root) / test_file
+
+                if not test_path.exists():
+                    continue
+
+                current_test_code = test_path.read_text(
+                    encoding="utf-8",
+                    errors="replace"
+                )
+
+                correction_context = (
+                    "The previous test compatibility modernization did not compile.\n"
+                    "Correct only the test class using the compiler error below.\n"
+                    "Preserve all assertions and test intent.\n"
+                    "Do not modify production source code.\n\n"
+                    "COMPILER ERROR:\n"
+                    f"{test_compile_log[-6000:]}\n\n"
+                    "IMPORTANT TYPE RULE:\n"
+                    "CompletableFuture completion callbacks receive Throwable, "
+                    "not Exception. Use Throwable where required.\n\n"
+                    "CURRENT MODERNIZED PRODUCTION SOURCE:\n"
+                    f"{production_context}"
+                )
+
+                correction_result = modernize_code_snippet(
+                    file_path=str(test_path),
+                    description=(
+                        "Correct this modernized test so it compiles against "
+                        "the current production API. Fix the exact compiler "
+                        "errors without removing tests or assertions."
+                    ),
+                    target_java=target_java,
+                    legacy_code=current_test_code,
+                    pattern_id="TEST_COMPATIBILITY_FIX",
+                    rag_context=correction_context
+                )
+
+                if correction_result.get("status") != "success":
+                    logger.error(
+                        "Corrective test modernization failed for %s: %s",
+                        test_file,
+                        correction_result.get("message")
+                    )
+                    return
+
+            test_compile_ok, test_compile_log = (
+                run_test_compile_validation(repo_root)
+            )
+
+            if not test_compile_ok:
+                logger.error(
+                    "Test classes still fail after the corrective pass.\n%s",
+                    test_compile_log[-8000:]
+                )
+                return
+
+        logger.info(
+            "✅ Test compatibility modernization completed successfully."
+        )
+
+    else:
+        logger.info(
+            "✅ Existing tests compile against the modernized production API."
+        )
+
+    # ================================================================
+    # STEP 5: Comprehensive project validation gates
+    # ================================================================
+
+    if not ACCUMULATED_CHANGES_CACHE:
+        logger.warning(
+            "No functional code adjustments cleared validation. "
+            "Skipping PR submission."
+        )
+        return
+
+    logger.info(
+        "Captured %d validated file change(s). "
+        "Advancing to global project validation.",
+        len(ACCUMULATED_CHANGES_CACHE)
+    )
+
+    build_ok, build_log = run_global_project_build(repo_root)
+
+    if not build_ok:
+        logger.error(
+            "🛑 CRITICAL BUILD BLOCKER: "
+            "Global Maven build failed.\n%s",
+            build_log[-8000:]
+        )
+        return
+        
+    boot_ok, boot_log = run_springboot_boot_check(repo_root)
+
+    if not boot_ok:
+        logger.error(
+            "🛑 CRITICAL RUNTIME BLOCKER: "
+            "Application failed to boot cleanly.\n%s",
+            boot_log
+        )
+        return
+
+    # ================================================================
+    # STATIC ANALYSIS VALIDATION GATE
+    # ================================================================
+
+    static_ok, static_log, static_tool = (
+        run_static_analysis_validation(repo_root)
+    )
+
+    if not static_ok:
+        logger.error(
+            "🛑 STATIC ANALYSIS BLOCKER: %s validation failed.\n%s",
+            static_tool,
+            static_log[-8000:]
+        )
+        return
+
+    if static_tool == "SKIPPED":
+        logger.info(
+            "ℹ️ Static analysis skipped because the project does not "
+            "configure Checkstyle or PMD."
+        )
+    else:
+        logger.info(
+            "✅ Static analysis passed using %s.",
+            static_tool
+        )
+
+    logger.info(
+        "🎉 All validation gates passed. "
+        "Pushing validated updates to GitHub."
+    )
+
+    # ================================================================
+    # STEP 6: Create GitHub branch and Pull Request
+    # ================================================================
+
+    logger.info(
+        "🎉 All validation gates passed. "
+        "Pushing validated updates to GitHub."
+    )
+
+    pr_result = create_pull_request(
+        repo_owner=os.environ.get("GITHUB_OWNER", ""),
+        repo_name=os.environ.get("GITHUB_REPO", ""),
+        base_branch="main",
+        changes=ACCUMULATED_CHANGES_CACHE
+    )
+
+    if pr_result.get("status") == "success":
+        logger.info(
+            "✨ Modernization workflow successful. "
+            "Pull Request: %s",
+            pr_result.get("pr_url")
+        )
+    else:
+        logger.error(
+            "🛑 Modernization completed, but GitHub submission failed: %s",
+            pr_result.get("message", "Unknown GitHub error")
+        )
 
 if __name__ == "__main__":
     import asyncio
@@ -575,16 +1078,37 @@ if __name__ == "__main__":
 
     # --- Automatically Extract Slug Context details from the input URL ---
         # --- Automatically Extract Slug Context details from the input URL ---
+    # Extract GitHub owner and repository from the entered URL.
     if "github.com" in target_repo:
-        # SRAO FIX: Clean out protocol headers and trailing components cleanly
-        clean_url = target_repo.replace("https://", "").replace("http://", "").replace(".git", "").rstrip("/")
-        url_parts = clean_url.split("://github.com")
-        if len(url_parts) > 1:
-            slug_parts = url_parts[1].split("/")
-            if len(slug_parts) >= 2:
-                # Safely assign parameters directly into active environment fields
-                os.environ["GITHUB_OWNER"] = slug_parts[0]
-                os.environ["GITHUB_REPO"]  = slug_parts[1]
+
+        clean_url = (
+            target_repo
+            .replace("https://", "")
+            .replace("http://", "")
+            .replace("git@github.com:", "")
+            .rstrip("/")
+        )
+
+        if clean_url.endswith(".git"):
+            clean_url = clean_url[:-4]
+
+        # clean_url is now:
+        # github.com/owner/repository
+        # or owner/repository for SSH-style inputs
+        if clean_url.startswith("github.com/"):
+            clean_url = clean_url[len("github.com/"):]
+
+        slug_parts = clean_url.split("/")
+
+        if len(slug_parts) >= 2:
+            os.environ["GITHUB_OWNER"] = slug_parts[0]
+            os.environ["GITHUB_REPO"] = slug_parts[1]
+        else:
+            print(
+                "❌ Unable to determine GitHub owner and repository "
+                f"from: {target_repo}"
+            )
+            sys.exit(1)
 
     print("\n🚀 Initializing multi-agent migration environment sequence loop workflow.")
     print(f"   - Target Repo:      {target_repo}")

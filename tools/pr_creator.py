@@ -191,18 +191,36 @@ def create_pull_request(
         }
 
     # Find the cloned repository used by this pipeline run.
-    paths = sorted(
-        Path("/tmp").glob("srao_repo_*"),
-        key=os.path.getmtime
-    )
+    local_repo_path = ""
 
-    if not paths:
+    for change in changes:
+        candidate_repo_path = str(
+            change.get("repo_path", "")
+        ).strip()
+
+        if candidate_repo_path:
+            local_repo_path = candidate_repo_path
+            break
+
+    if not local_repo_path:
         return {
             "status": "error",
-            "message": "No valid Git repository found under /tmp."
+            "message": "Repository path is missing from change metadata."
         }
 
-    local_repo_path = str(paths[-1])
+    repo_directory = Path(local_repo_path)
+
+    if not repo_directory.is_dir():
+        return {
+            "status": "error",
+            "message": f"Repository path does not exist: {local_repo_path}"
+        }
+
+    if not (repo_directory / ".git").exists():
+        return {
+            "status": "error",
+            "message": f"Path is not a Git repository: {local_repo_path}"
+        }
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     feature_branch = f"srao/modernized_code_{timestamp}"
@@ -286,6 +304,30 @@ def create_pull_request(
                 check=True
             )
 
+        # ==========================================================
+        # DEBUG LOGGING
+        # ==========================================================
+
+        current_origin = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=local_repo_path,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        logger.info(
+            "Current cloned repository origin: %s",
+            current_origin.stdout.strip()
+        )
+
+        logger.info(
+            "GitHub destination resolved as: %s/%s",
+            owner,
+            repo
+        )
+
+        # ==========================================================
         subprocess.run(
             ["git", "checkout", "-b", feature_branch],
             cwd=local_repo_path,
