@@ -162,3 +162,23 @@ The agent will automatically perform the following steps:
 9. Run PMD / Checkstyle (if configured).
 10. Create a GitHub feature branch and Pull Request.
 11. Generate JSON and Markdown modernization reports.
+-----------------------------------------------------------------
+Before tests
+   ↓
+Look for test configuration
+   ↓
+application-test.properties / application-test.yml / application-test.yaml
+   ↓
+Found?
+ ┌─────┴─────┐
+Yes          No
+ ↓             ↓
+Use test      Run normally
+profile       without inventing config
+ ↓             ↓
+Run tests ─────┘
+   ↓
+PASS → continue
+FAIL → capture actual Maven failure
+   ↓
+Put reason in SRAO report
