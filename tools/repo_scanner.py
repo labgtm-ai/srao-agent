@@ -689,3 +689,38 @@ def run_static_analysis_validation(
         "No Checkstyle or PMD plugin configured.",
         "SKIPPED"
     )
+    
+def detect_test_configuration(repo_root: str) -> dict:
+    """
+    Detect Spring Boot test configuration already available
+    in the repository.
+
+    Does not create or modify any configuration.
+    """
+
+    import os
+
+    candidates = [
+        "src/test/resources/application-test.properties",
+        "src/test/resources/application-test.yml",
+        "src/test/resources/application-test.yaml",
+        "src/main/resources/application-test.properties",
+        "src/main/resources/application-test.yml",
+        "src/main/resources/application-test.yaml",
+    ]
+
+    for relative_path in candidates:
+        full_path = os.path.join(repo_root, relative_path)
+
+        if os.path.isfile(full_path):
+            return {
+                "present": True,
+                "profile": "test",
+                "config_file": relative_path,
+            }
+
+    return {
+        "present": False,
+        "profile": None,
+        "config_file": None,
+    }
