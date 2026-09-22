@@ -535,6 +535,51 @@ def run_test_execution_validation(
     except Exception as exc:
         return False, f"Maven test execution failed to execute: {exc}"
 
+def extract_test_execution_failure_reason(test_log: str) -> str:
+    """
+    Extract a concise failure reason from Maven/Spring test execution output.
+    """
+
+    if not test_log:
+        return "Unit tests failed, but no diagnostic output was available."
+
+    important_markers = [
+        "Could not resolve placeholder",
+        "Failed to configure a DataSource",
+        "Failed to load ApplicationContext",
+        "BeanCreationException",
+        "UnsatisfiedDependencyException",
+        "NoSuchBeanDefinitionException",
+        "Connection refused",
+        "UnknownHostException",
+        "IllegalStateException",
+    ]
+
+    matched_lines = []
+
+    for line in test_log.splitlines():
+        stripped = line.strip()
+
+        if any(marker in stripped for marker in important_markers):
+            if stripped not in matched_lines:
+                matched_lines.append(stripped)
+
+    if matched_lines:
+        return "\n".join(matched_lines[:10])
+
+    # No known configuration/environment pattern found.
+    # Return the last useful Maven error lines.
+    error_lines = [
+        line.strip()
+        for line in test_log.splitlines()
+        if "[ERROR]" in line
+    ]
+
+    if error_lines:
+        return "\n".join(error_lines[-10:])
+
+    return "Unit tests failed. See Maven test output for additional details."
+
 def extract_failing_test_files(
     repo_root: str,
     compile_log: str
