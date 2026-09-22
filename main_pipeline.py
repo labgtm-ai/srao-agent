@@ -468,7 +468,8 @@ def stage2_process_batches(
         prepare_maven_target_version,
         run_static_analysis_validation,
         clean_backup_files,
-        revert_file_changes
+        revert_file_changes,
+        detect_test_configuration
     )
     from tools.pr_creator import create_pull_request
 
