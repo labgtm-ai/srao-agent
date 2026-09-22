@@ -26,6 +26,7 @@ class ReportGenerator:
         summary_reports: List[Dict[str, Any]],
         repo_url: str = "Target Project Base",
         validation_results: Optional[Dict[str, Any]] = None,
+        pr_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Orchestration adapter bridging multi-agent data loops to static
@@ -37,7 +38,6 @@ class ReportGenerator:
         # Flatten findings and changes from raw pipeline execution objects
         findings = []
         changes = []
-        pr_url = None
 
         for item in summary_reports:
             # Handle both raw schema entries and nested batch responses safely
