@@ -1012,6 +1012,31 @@ def stage2_process_batches(
     validation_results["test_compile"] = True
 
     # ================================================================
+    # STEP 5: Execute unit tests
+    # ================================================================
+    
+    logger.info(
+        "=== UNIT TEST EXECUTION VALIDATION ==="
+    )
+    
+    unit_test_ok, unit_test_log = (
+        run_test_execution_validation(
+            repo_root,
+            test_config
+        )
+    )
+    
+    if unit_test_ok:
+        logger.info(
+            "✅ Unit tests executed successfully."
+        )
+    else:
+        logger.warning(
+            "⚠️ Unit test execution failed.\n%s",
+            unit_test_log[-8000:]
+        )
+
+    # ================================================================
     # STEP 5: Comprehensive project validation gates
     # ================================================================
 
