@@ -1030,11 +1030,18 @@ def stage2_process_batches(
         logger.info(
             "✅ Unit tests executed successfully."
         )
+    
+        validation_results["unit_tests"] = True
+        validation_results["unit_test_log"] = ""
+
     else:
         logger.warning(
             "⚠️ Unit test execution failed.\n%s",
             unit_test_log[-8000:]
         )
+
+    validation_results["unit_tests"] = False
+    validation_results["unit_test_log"] = unit_test_log
 
     # ================================================================
     # STEP 5: Comprehensive project validation gates
