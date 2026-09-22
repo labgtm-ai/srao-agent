@@ -111,6 +111,28 @@ def print_execution_summary(
     logger.info("%s Baseline Compile", status(validation_results.get("baseline_compile")))
     logger.info("%s Production Compile", status(validation_results.get("production_compile")))
     logger.info("%s Test Compile", status(validation_results.get("test_compile")))
+    logger.info(
+        "%s Unit Test Execution",
+        status(validation_results.get("unit_tests"))
+    )
+    if validation_results.get("test_config_present"):
+        logger.info(
+            "   Test Config Used     : %s",
+            validation_results.get("test_config_file")
+        )
+    else:
+        logger.info(
+            "   Test Config Used     : Not found"
+        )
+    
+    if validation_results.get("unit_tests") is False:
+        logger.info(
+            "   Test Failure Reason  : %s",
+            validation_results.get(
+                "unit_test_failure_reason",
+                "Unknown"
+            )
+        )
     logger.info("%s Global Maven Build", status(validation_results.get("global_build")))
     logger.info("%s Spring Boot Startup", status(validation_results.get("spring_boot")))
     logger.info(
@@ -464,6 +486,7 @@ def stage2_process_batches(
         run_compile_validation,
         run_test_compile_validation,
         run_test_execution_validation,
+        extract_test_execution_failure_reason,
         extract_failing_test_files,
         run_target_baseline_compile,
         prepare_maven_target_version,
@@ -499,6 +522,10 @@ def stage2_process_batches(
         "baseline_compile": False,
         "production_compile": False,
         "test_compile": False,
+        "unit_tests": None,
+        "unit_test_failure_reason": None,
+        "test_config_present": test_config["present"],
+        "test_config_file": test_config["config_file"],
         "global_build": False,
         "spring_boot": False,
         "static_analysis": False,
@@ -1033,6 +1060,7 @@ def stage2_process_batches(
     
         validation_results["unit_tests"] = True
         validation_results["unit_test_log"] = ""
+        validation_results["unit_test_failure_reason"] = None
 
     else:
         logger.warning(
@@ -1040,8 +1068,12 @@ def stage2_process_batches(
             unit_test_log[-8000:]
         )
 
-    validation_results["unit_tests"] = False
-    validation_results["unit_test_log"] = unit_test_log
+        validation_results["unit_tests"] = False
+        validation_results["unit_test_log"] = unit_test_log
+        
+        validation_results["unit_test_failure_reason"] = (
+            extract_test_execution_failure_reason(unit_test_log)
+        )
 
     # ================================================================
     # STEP 5: Comprehensive project validation gates
