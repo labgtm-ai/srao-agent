@@ -1183,7 +1183,8 @@ def stage2_process_batches(
     report_result = report_generator.build(
         summary_reports=ACCUMULATED_CHANGES_CACHE,
         repo_url=stage1_data.get("repo_url", "Target Project"),
-        validation_results=validation_results
+        validation_results=validation_results,
+        pr_url=pr_result.get("pr_url")
     )
     
     logger.info(
