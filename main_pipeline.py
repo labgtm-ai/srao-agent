@@ -463,6 +463,7 @@ def stage2_process_batches(
     from tools.repo_scanner import (
         run_compile_validation,
         run_test_compile_validation,
+        run_test_execution_validation,
         extract_failing_test_files,
         run_target_baseline_compile,
         prepare_maven_target_version,
