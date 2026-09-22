@@ -477,6 +477,16 @@ def stage2_process_batches(
     findings_by_file = stage1_data.get("findings_by_file", {})
     repo_root = stage1_data["repo_path"]
 
+    test_config = detect_test_configuration(repo_root)
+
+    if test_config["present"]:
+        print(
+            f"🧪 Test configuration detected: "
+            f"{test_config['config_file']}"
+        )
+    else:
+        print("ℹ️ No application-test configuration detected.")
+        
     requested_target_version = int(
         stage1_data.get("target_version", 21)
     )
