@@ -476,6 +476,65 @@ def run_test_compile_validation(
     except Exception as exc:
         return False, f"Maven test compilation failed to execute: {exc}"
 
+def run_test_execution_validation(
+    repo_root: str,
+    test_config: dict
+) -> tuple[bool, str]:
+    """
+    Executes Maven tests.
+
+    If repository-provided application-test configuration exists,
+    activates the Spring 'test' profile.
+    """
+
+    root_path = Path(repo_root)
+
+    if not (root_path / "pom.xml").exists():
+        return True, ""
+
+    try:
+        command = [
+            "mvn",
+            "test"
+        ]
+
+        if test_config.get("present"):
+            command.append("-Dspring.profiles.active=test")
+
+            logger.info(
+                "Running Maven tests using test configuration: %s",
+                test_config.get("config_file")
+            )
+        else:
+            logger.info(
+                "Running Maven tests without application-test configuration."
+            )
+
+        result = subprocess.run(
+            command,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        output = (
+            (result.stdout or "")
+            + "\n"
+            + (result.stderr or "")
+        )
+
+        if result.returncode == 0:
+            return True, output
+
+        return False, output
+
+    except subprocess.TimeoutExpired:
+        return False, "Maven test execution timed out after 300 seconds."
+
+    except Exception as exc:
+        return False, f"Maven test execution failed to execute: {exc}"
+
 def extract_failing_test_files(
     repo_root: str,
     compile_log: str
