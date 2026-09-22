@@ -496,6 +496,7 @@ def stage2_process_batches(
         detect_test_configuration
     )
     from tools.pr_creator import create_pull_request
+    from tools.report_generator import ReportGenerator
 
     ordered_files = stage1_data.get("ordered_files", [])
     findings_by_file = stage1_data.get("findings_by_file", {})
@@ -1173,6 +1174,23 @@ def stage2_process_batches(
         pr_result.get("status") == "success"
     )
 
+    # ================================================================
+    # Generate modernization report
+    # ================================================================
+    
+    report_generator = ReportGenerator()
+    
+    report_result = report_generator.build(
+        summary_reports=ACCUMULATED_CHANGES_CACHE,
+        repo_url=stage1_data.get("repo_url", "Target Project"),
+        validation_results=validation_results
+    )
+    
+    logger.info(
+        "📊 Modernization report generated: %s",
+        report_result.get("markdown_report")
+    )
+    
     if pr_result.get("status") == "success":
         logger.info(
             "✨ Modernization workflow successful. "
